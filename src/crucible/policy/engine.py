@@ -14,16 +14,23 @@ import yaml
 from .schema import AttackScenario, PolicyDomain
 
 _DOMAINS_DIR = Path(__file__).parent / "domains"
+_USER_POLICIES_DIR = Path(".crucible/policies")
 
 
 def load_domain(domain_spec: str) -> PolicyDomain:
-    """Load a policy domain by name or name@version (e.g., 'owasp_top10@2025.1')."""
+    """Load a policy domain by name or name@version (e.g., 'owasp_top10@2025.1').
+
+    Search order: .crucible/policies/ (installed) → built-in policy/domains/.
+    """
     name = domain_spec.split("@")[0].strip()
-    yaml_path = _DOMAINS_DIR / f"{name}.yaml"
+    # Check user-installed policies first, then fall back to built-ins
+    yaml_path = _USER_POLICIES_DIR / f"{name}.yaml"
+    if not yaml_path.exists():
+        yaml_path = _DOMAINS_DIR / f"{name}.yaml"
 
     if not yaml_path.exists():
         raise FileNotFoundError(
-            f"Policy domain '{name}' not found at {yaml_path}. "
+            f"Policy domain '{name}' not found. "
             f"Available: {list_available_domains()}"
         )
 
@@ -70,7 +77,10 @@ def combine_policy_context(domains: list[PolicyDomain]) -> str:
 
 
 def list_available_domains() -> list[str]:
-    return [p.stem for p in _DOMAINS_DIR.glob("*.yaml")]
+    """Return all domain names: built-in + user-installed (deduped, sorted)."""
+    builtin = {p.stem for p in _DOMAINS_DIR.glob("*.yaml")}
+    installed = {p.stem for p in _USER_POLICIES_DIR.glob("*.yaml")} if _USER_POLICIES_DIR.exists() else set()
+    return sorted(builtin | installed)
 
 
 def validate_domain_yaml(domain_or_path) -> list[str]:

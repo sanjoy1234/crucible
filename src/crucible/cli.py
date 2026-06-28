@@ -515,6 +515,87 @@ def policy_list():
     console.print(table)
 
 
+@policy.command("install")
+@click.argument("domain")
+@click.option("--force", is_flag=True, help="Overwrite if already installed")
+@click.option("--policies-dir", default=".crucible/policies", show_default=True,
+              help="Local directory to install the domain into")
+def policy_install(domain: str, force: bool, policies_dir: str):
+    """Download and install a community domain from the Policy Hub."""
+    from .policy.hub import install_domain
+    from pathlib import Path as _Path
+
+    console.print(f"Fetching Policy Hub index...")
+    result = install_domain(domain, policies_dir=_Path(policies_dir), force=force)
+
+    if result.already_installed:
+        console.print(f"[yellow]⚠[/yellow]  '{domain}' already installed at {result.installed_path}. Use --force to reinstall.")
+    elif result.success:
+        console.print(f"[green]✓[/green]  Installed '{domain}' v{result.version} → {result.installed_path}")
+        console.print(f"  Use: [bold]crucible run --domain {domain}[/bold]")
+    else:
+        console.print(f"[red]✗[/red]  {result.error}")
+        sys.exit(1)
+
+
+@policy.command("search")
+@click.argument("query")
+def policy_search(query: str):
+    """Search the Policy Hub for domains matching a keyword or tag."""
+    from .policy.hub import search_index
+
+    try:
+        entries = search_index(query)
+    except RuntimeError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    if not entries:
+        console.print(f"No domains found matching '{query}'.")
+        return
+
+    table = Table(show_header=True, header_style="bold",
+                  title=f"Policy Hub — '{query}' results")
+    table.add_column("Domain", style="bold")
+    table.add_column("Version")
+    table.add_column("Framework")
+    table.add_column("Scenarios", justify="right")
+    table.add_column("Tags", style="dim")
+
+    for e in entries:
+        table.add_row(
+            e.name, e.version, e.regulatory_framework,
+            str(e.scenarios_count), ", ".join(e.tags[:3]),
+        )
+    console.print(table)
+
+
+@policy.command("hub")
+def policy_hub():
+    """List all domains available in the remote Policy Hub."""
+    from .policy.hub import fetch_index
+
+    try:
+        entries = fetch_index()
+    except RuntimeError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    table = Table(show_header=True, header_style="bold", title="CRUCIBLE Policy Hub")
+    table.add_column("Domain", style="bold")
+    table.add_column("Version")
+    table.add_column("Framework")
+    table.add_column("Scenarios", justify="right")
+    table.add_column("Tags", style="dim")
+
+    for e in entries:
+        table.add_row(
+            e.name, e.version, e.regulatory_framework,
+            str(e.scenarios_count), ", ".join(e.tags[:3]),
+        )
+    console.print(table)
+
+
 @policy.command("validate")
 @click.argument("domain")
 def policy_validate(domain: str):
