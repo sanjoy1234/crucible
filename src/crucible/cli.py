@@ -804,6 +804,46 @@ def serve(port: int, host: str, reload: bool, rbac: bool):
     )
 
 
+@main.group()
+def forge_network():
+    """Forge Network — opt-in community adversarial pattern sharing."""
+
+
+@forge_network.command("status")
+def forge_network_status():
+    """Show Forge Network opt-in status and hub statistics."""
+    from .network.forge_network import ForgeNetworkConfig, fetch_hub_stats
+    cfg = ForgeNetworkConfig.from_env()
+    if cfg.enabled:
+        console.print(f"[green]Forge Network: ENABLED[/green]  hub={cfg.hub_url}")
+        console.print(f"  Contributor ID: {cfg.contributor_id}")
+        console.print(f"  Min ARS to share: {cfg.min_ars_to_share}")
+        stats = fetch_hub_stats(cfg)
+        if stats:
+            console.print(f"  Hub patterns: {stats.get('total_patterns', 'N/A')}")
+        else:
+            console.print("  Hub: unreachable (offline or not yet launched)")
+    else:
+        console.print("[yellow]Forge Network: DISABLED[/yellow]")
+        console.print("  Enable with: CRUCIBLE_FORGE_NETWORK_ENABLED=true")
+
+
+@forge_network.command("pull")
+@click.argument("cwe")
+@click.option("--limit", default=50, show_default=True, help="Max patterns to pull")
+def forge_network_pull(cwe: str, limit: int):
+    """Pull community-discovered attack patterns for a CWE from the hub."""
+    from .network.forge_network import ForgeNetworkConfig, pull_patterns
+    cfg = ForgeNetworkConfig.from_env()
+    patterns, result = pull_patterns(cwe, cfg, limit=limit)
+    if not result.success:
+        console.print(f"[red]Pull failed:[/red] {result.error}")
+        return
+    console.print(f"[green]Pulled {len(patterns)} pattern(s) for {cwe}[/green]")
+    for p in patterns[:5]:
+        console.print(f"  [{p.severity}] {p.verdict}: {p.attack_vector[:80]}")
+
+
 @main.command()
 @click.option("--jsonl", "jsonl_path", type=click.Path(), default=None,
               help="Path to JSONL file with agent scores (agent_name, task_id, ars_score per line)")
