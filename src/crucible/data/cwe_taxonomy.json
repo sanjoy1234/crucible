@@ -1,0 +1,22 @@
+{
+  "CWE-89":  "SQL Injection — unsanitized user input concatenated into SQL queries",
+  "CWE-79":  "Cross-site Scripting (XSS) — user-controlled data rendered without escaping in HTML",
+  "CWE-22":  "Path Traversal — user input used in file paths without sanitization (../)",
+  "CWE-78":  "OS Command Injection — user input passed to shell execution functions",
+  "CWE-352": "Cross-Site Request Forgery (CSRF) — state-changing requests without anti-CSRF tokens",
+  "CWE-362": "Race Condition (TOCTOU) — time-of-check vs time-of-use in concurrent code",
+  "CWE-476": "NULL Pointer Dereference — accessing memory through unvalidated null pointer",
+  "CWE-190": "Integer Overflow / Wraparound — arithmetic without bounds checking",
+  "CWE-125": "Out-of-bounds Read — buffer read beyond allocated size",
+  "CWE-787": "Out-of-bounds Write — buffer write beyond allocated size (heap/stack overflow)",
+  "CWE-502": "Deserialization of Untrusted Data — unsafe deserialization enabling RCE",
+  "CWE-611": "XML External Entity (XXE) Injection — external entity references in XML parsing",
+  "CWE-918": "Server-Side Request Forgery (SSRF) — server-side requests to user-controlled URLs",
+  "CWE-285": "Improper Authorization — missing or bypassable access control checks",
+  "CWE-798": "Hard-coded Credentials — secrets embedded in source code",
+  "CWE-327": "Broken Cryptographic Algorithm — use of weak or obsolete crypto primitives",
+  "CWE-330": "Insufficient Randomness — predictable token/nonce generation",
+  "CWE-20":  "Improper Input Validation — missing validation at trust boundary",
+  "CWE-400": "Uncontrolled Resource Consumption — missing rate limiting or quota enforcement",
+  "CWE-601": "Open Redirect — URL redirect to user-controlled destination"
+}
