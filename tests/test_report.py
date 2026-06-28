@@ -14,6 +14,9 @@ from crucible.output.report import (
     build_report,
     generate_run_id,
     render_markdown,
+    render_html,
+    render_sarif,
+    render_junit_xml,
     save_report,
     load_report,
     verify_integrity,
@@ -89,3 +92,156 @@ def test_mitigated_partial_missed_counts():
     assert report["mitigated_count"] == 2
     assert report["partial_count"] == 1
     assert report["miss_count"] == 1
+
+
+# ── HTML ──────────────────────────────────────────────────────────────────────
+
+def test_render_html_is_valid_document():
+    result = _make_result([1.0, 0.5, 0.0])
+    report = build_report(result, generate_run_id())
+    html = render_html(report)
+    assert html.startswith("<!DOCTYPE html>")
+    assert "</html>" in html
+
+
+def test_render_html_contains_ars():
+    result = _make_result([1.0, 0.5, 0.0])
+    report = build_report(result, generate_run_id())
+    html = render_html(report)
+    ars = f"{report['ars_score']:.2f}"
+    assert ars in html
+
+
+def test_render_html_gate_passed():
+    result = _make_result([1.0, 1.0, 1.0])
+    report = build_report(result, generate_run_id())
+    html = render_html(report)
+    assert "PASSED" in html
+
+
+def test_render_html_gate_blocked():
+    result = _make_result([0.0, 0.0, 0.0])
+    report = build_report(result, generate_run_id())
+    html = render_html(report)
+    assert "BLOCKED" in html
+
+
+def test_render_html_contains_integrity_hash():
+    result = _make_result([1.0])
+    report = build_report(result, generate_run_id())
+    html = render_html(report)
+    assert "sha256:" in html
+
+
+# ── SARIF ─────────────────────────────────────────────────────────────────────
+
+def test_render_sarif_is_valid_json():
+    result = _make_result([1.0, 0.0])
+    report = build_report(result, generate_run_id())
+    sarif_str = render_sarif(report)
+    sarif = json.loads(sarif_str)
+    assert sarif["version"] == "2.1.0"
+
+
+def test_render_sarif_has_runs():
+    result = _make_result([1.0, 0.5, 0.0])
+    report = build_report(result, generate_run_id())
+    sarif = json.loads(render_sarif(report))
+    assert len(sarif["runs"]) == 1
+    run = sarif["runs"][0]
+    assert run["tool"]["driver"]["name"] == "CRUCIBLE"
+
+
+def test_render_sarif_missed_attack_is_error():
+    result = _make_result([0.0])
+    report = build_report(result, generate_run_id())
+    sarif = json.loads(render_sarif(report))
+    results = sarif["runs"][0]["results"]
+    assert any(r["level"] == "error" for r in results)
+
+
+def test_render_sarif_mitigated_attack_is_note():
+    result = _make_result([1.0])
+    report = build_report(result, generate_run_id())
+    sarif = json.loads(render_sarif(report))
+    results = sarif["runs"][0]["results"]
+    assert all(r["level"] == "note" for r in results)
+
+
+def test_render_sarif_has_rules_for_each_cwe():
+    result = _make_result([1.0, 0.0])
+    report = build_report(result, generate_run_id())
+    # Both attacks use CWE-89 in _make_result — one unique rule expected
+    sarif = json.loads(render_sarif(report))
+    rules = sarif["runs"][0]["tool"]["driver"]["rules"]
+    assert len(rules) >= 1
+    assert rules[0]["id"] == "CWE-89"
+
+
+# ── JUnit XML ─────────────────────────────────────────────────────────────────
+
+def test_render_junit_xml_is_valid_xml():
+    import xml.etree.ElementTree as ET
+    result = _make_result([1.0, 0.5, 0.0])
+    report = build_report(result, generate_run_id())
+    xml_str = render_junit_xml(report)
+    root = ET.fromstring(xml_str.split("\n", 1)[1])  # skip <?xml?> declaration
+    assert root.tag == "testsuites"
+
+
+def test_render_junit_xml_failure_for_missed():
+    import xml.etree.ElementTree as ET
+    result = _make_result([0.0, 1.0])
+    report = build_report(result, generate_run_id())
+    xml_str = render_junit_xml(report)
+    root = ET.fromstring(xml_str.split("\n", 1)[1])
+    failures = root.findall(".//failure")
+    assert len(failures) == 1
+
+
+def test_render_junit_xml_no_failure_for_mitigated():
+    import xml.etree.ElementTree as ET
+    result = _make_result([1.0, 1.0])
+    report = build_report(result, generate_run_id())
+    xml_str = render_junit_xml(report)
+    root = ET.fromstring(xml_str.split("\n", 1)[1])
+    failures = root.findall(".//failure")
+    assert len(failures) == 0
+
+
+def test_render_junit_xml_test_counts():
+    import xml.etree.ElementTree as ET
+    result = _make_result([1.0, 0.5, 0.0])
+    report = build_report(result, generate_run_id())
+    xml_str = render_junit_xml(report)
+    root = ET.fromstring(xml_str.split("\n", 1)[1])
+    assert root.attrib["tests"] == "3"
+    assert root.attrib["failures"] == "1"
+
+
+# ── Harness command ───────────────────────────────────────────────────────────
+
+def test_harness_report_supported_formats_constant():
+    from crucible.harness.commands.report import SUPPORTED_FORMATS
+    for fmt in ("md", "json", "html", "sarif", "junit"):
+        assert fmt in SUPPORTED_FORMATS
+
+
+def test_harness_report_unknown_format_raises():
+    from crucible.harness.commands.report import execute
+    try:
+        execute("any-run-id", fmt="pdf")
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "pdf" in str(e)
+
+
+def test_all_render_functions_produce_output():
+    import json as _json
+    result = _make_result([1.0, 0.5, 0.0])
+    report = build_report(result, generate_run_id())
+
+    assert len(render_markdown(report)) > 100
+    assert len(render_html(report)) > 200
+    assert len(_json.loads(render_sarif(report))["runs"]) == 1
+    assert "<testsuites" in render_junit_xml(report)

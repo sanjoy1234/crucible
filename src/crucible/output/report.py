@@ -1,5 +1,5 @@
 """
-Resilience Report — JSON schema + Markdown PR artifact.
+Resilience Report — JSON, Markdown, HTML, SARIF, and JUnit XML outputs.
 
 The report is tamper-evident: integrity_hash is SHA-256 over the
 lexicographically sorted JSON-serialized attack array.
@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -149,6 +150,208 @@ def render_markdown(report: dict) -> str:
     ]
 
     return "\n".join(lines)
+
+
+def render_html(report: dict) -> str:
+    """Render a self-contained HTML Resilience Report viewable in any browser."""
+    ars = report["ars_score"]
+    gate = "PASSED" if ars >= 0.80 else "BLOCKED"
+    gate_color = "#047857" if ars >= 0.80 else "#B91C1C"
+    ars_pct = int(ars * 100)
+
+    verdict_color = {"MITIGATED": "#047857", "PARTIAL": "#92400E", "MISSED": "#B91C1C"}
+    verdict_icon = {"MITIGATED": "✅", "PARTIAL": "⚠️", "MISSED": "❌"}
+
+    attack_rows = ""
+    for a in report.get("attacks", []):
+        v = a["verdict"]
+        color = verdict_color.get(v, "#111")
+        icon = verdict_icon.get(v, "?")
+        attack_rows += (
+            f"<tr>"
+            f"<td><code>{a['id']}</code></td>"
+            f"<td><code>{a['cwe']}</code></td>"
+            f"<td>{a['title']}</td>"
+            f"<td>{a.get('severity', '—')}</td>"
+            f"<td style='color:{color};font-weight:600'>{icon} {v}</td>"
+            f"</tr>\n"
+        )
+
+    control_rows = ""
+    for framework, controls in report.get("control_mappings", {}).items():
+        control_rows += f"<tr><td><strong>{framework}</strong></td><td>{', '.join(controls)}</td></tr>\n"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CRUCIBLE Resilience Report — {report['run_id']}</title>
+<style>
+  body{{font-family:system-ui,-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:40px 24px;background:#FAFAFA;color:#111827}}
+  h1{{font-size:22px;font-weight:700;margin-bottom:4px}}
+  .meta{{font-size:12px;color:#6B7280;font-family:monospace;margin-bottom:32px}}
+  .score-box{{background:#fff;border:1px solid #E5E7EB;border-radius:8px;padding:20px 24px;display:flex;align-items:center;gap:32px;margin-bottom:24px}}
+  .ars-num{{font-size:48px;font-weight:800;color:{gate_color};line-height:1}}
+  .gate-badge{{background:{gate_color};color:#fff;padding:4px 12px;border-radius:4px;font-size:13px;font-weight:700}}
+  .stat{{font-size:13px;color:#374151}}.stat strong{{font-size:18px;display:block}}
+  table{{width:100%;border-collapse:collapse;font-size:13.5px;background:#fff;border-radius:8px;overflow:hidden;border:1px solid #E5E7EB;margin-bottom:24px}}
+  th{{background:#F3F4F6;padding:10px 14px;text-align:left;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#6B7280}}
+  td{{padding:10px 14px;border-top:1px solid #F3F4F6}}
+  code{{font-family:monospace;font-size:11px;background:#F3F4F6;padding:1px 5px;border-radius:3px}}
+  .integrity{{font-size:11px;color:#9CA3AF;font-family:monospace;margin-top:24px;padding-top:16px;border-top:1px solid #E5E7EB}}
+  h2{{font-size:15px;font-weight:700;margin:28px 0 12px}}
+</style>
+</head>
+<body>
+<h1>🛡️ CRUCIBLE Resilience Report</h1>
+<div class="meta">Run: {report['run_id']} &nbsp;·&nbsp; {report.get('generated_at','')[:19].replace('T',' ')} UTC &nbsp;·&nbsp; Playbook: {report.get('playbook_version','')}</div>
+
+<div class="score-box">
+  <div>
+    <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:#6B7280;margin-bottom:4px">ARS Score</div>
+    <div class="ars-num">{ars:.2f}</div>
+    <div style="font-size:11px;color:#6B7280;margin-top:4px">{ars_pct}% resilience</div>
+  </div>
+  <div><span class="gate-badge">{gate}</span></div>
+  <div class="stat"><strong>{report.get('attack_count',0)}</strong>Attacks fired</div>
+  <div class="stat"><strong>{report.get('mitigated_count',0)}</strong>Mitigated</div>
+  <div class="stat"><strong>{report.get('partial_count',0)}</strong>Partial</div>
+  <div class="stat"><strong style="color:#B91C1C">{report.get('miss_count',0)}</strong>Missed</div>
+  <div class="stat"><strong>{report.get('elapsed_seconds',0)}s</strong>Elapsed</div>
+</div>
+
+<h2>Attack Breakdown</h2>
+<table>
+<thead><tr><th>ID</th><th>CWE</th><th>Title</th><th>Severity</th><th>Verdict</th></tr></thead>
+<tbody>{attack_rows}</tbody>
+</table>
+
+<h2>Compliance Control Mappings</h2>
+<table>
+<thead><tr><th>Framework</th><th>Controls</th></tr></thead>
+<tbody>{control_rows}</tbody>
+</table>
+
+<div class="integrity">Integrity: {report.get('integrity_hash','')}</div>
+</body>
+</html>"""
+
+
+def render_sarif(report: dict) -> str:
+    """Render a SARIF 2.1.0 document for GitHub Code Scanning integration."""
+    verdict_to_level = {"MITIGATED": "note", "PARTIAL": "warning", "MISSED": "error"}
+
+    # Build unique rule set from attacks
+    seen_cwes: dict[str, dict] = {}
+    for a in report.get("attacks", []):
+        cwe = a["cwe"]
+        if cwe not in seen_cwes:
+            cwe_num = cwe.replace("CWE-", "")
+            seen_cwes[cwe] = {
+                "id": cwe,
+                "name": a["title"].replace(" ", ""),
+                "shortDescription": {"text": a["title"]},
+                "helpUri": f"https://cwe.mitre.org/data/definitions/{cwe_num}.html",
+                "properties": {"tags": ["security", cwe]},
+            }
+
+    results = []
+    for a in report.get("attacks", []):
+        verdict = a.get("verdict", "MISSED")
+        results.append({
+            "ruleId": a["cwe"],
+            "level": verdict_to_level.get(verdict, "error"),
+            "message": {
+                "text": (
+                    f"[{a['cwe']}] {a['title']} — {verdict}. "
+                    f"Confidence: {a.get('confidence', 'medium')}. "
+                    f"{a.get('description', '')[:200]}"
+                )
+            },
+            "properties": {
+                "severity": a.get("severity", "medium"),
+                "verdict": verdict,
+                "ars_contribution": a.get("score", 0.0),
+            },
+        })
+
+    sarif = {
+        "version": "2.1.0",
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "CRUCIBLE",
+                        "version": "0.1.0",
+                        "informationUri": "https://github.com/sanjoy1234/crucible",
+                        "rules": list(seen_cwes.values()),
+                    }
+                },
+                "results": results,
+                "properties": {
+                    "run_id": report.get("run_id", ""),
+                    "ars_score": report.get("ars_score", 0.0),
+                    "playbook_version": report.get("playbook_version", ""),
+                    "integrity_hash": report.get("integrity_hash", ""),
+                },
+            }
+        ],
+    }
+    return json.dumps(sarif, indent=2)
+
+
+def render_junit_xml(report: dict) -> str:
+    """Render JUnit XML for CI/CD dashboard integration (Jenkins, Azure DevOps, etc.)."""
+    attacks = report.get("attacks", [])
+    failures = sum(1 for a in attacks if a.get("verdict") == "MISSED")
+    elapsed = report.get("elapsed_seconds", 0)
+    run_id = report.get("run_id", "unknown")
+    playbook = report.get("playbook_version", "crucible")
+
+    suites = ET.Element("testsuites", {
+        "name": "CRUCIBLE Adversarial Gate",
+        "tests": str(len(attacks)),
+        "failures": str(failures),
+        "time": str(elapsed),
+    })
+    suite = ET.SubElement(suites, "testsuite", {
+        "name": run_id,
+        "tests": str(len(attacks)),
+        "failures": str(failures),
+        "time": str(elapsed),
+        "timestamp": report.get("generated_at", "")[:19],
+    })
+
+    # Suite-level property: ARS score
+    props = ET.SubElement(suite, "properties")
+    ET.SubElement(props, "property", {"name": "ars_score", "value": str(report.get("ars_score", 0))})
+    ET.SubElement(props, "property", {"name": "playbook", "value": playbook})
+
+    for a in attacks:
+        verdict = a.get("verdict", "MISSED")
+        tc = ET.SubElement(suite, "testcase", {
+            "name": f"[{a['cwe']}] {a['title']}",
+            "classname": playbook,
+            "time": "0",
+        })
+        if verdict == "MISSED":
+            fail = ET.SubElement(tc, "failure", {
+                "message": f"Attack not mitigated: {a['title']}",
+                "type": "SecurityVulnerability",
+            })
+            fail.text = (
+                f"CWE: {a['cwe']}\n"
+                f"Severity: {a.get('severity', 'unknown')}\n"
+                f"Confidence: {a.get('confidence', 'medium')}\n"
+                f"Description: {a.get('description', '')[:300]}"
+            )
+        elif verdict == "PARTIAL":
+            warn = ET.SubElement(tc, "system-out")
+            warn.text = f"Partial mitigation: {a['title']} — review edge cases. CWE: {a['cwe']}"
+
+    ET.indent(suites, space="  ")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(suites, encoding="unicode")
 
 
 def _score_to_verdict(score: float) -> str:

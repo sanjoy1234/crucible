@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+SUPPORTED_FORMATS = ("md", "json", "html", "sarif", "junit")
+
 
 @dataclass
 class ReportResult:
@@ -21,30 +23,37 @@ def execute(
     """
     Load and render a stored Resilience Report.
 
-    Args:
-        run_id: The run_id to render
-        fmt: Output format — 'md', 'json', or 'html' (html = future)
-        config_path: Path to .crucible.yml
-
-    Returns:
-        ReportResult with rendered content string
+    Supported formats:
+      md    — Markdown (default, suitable for PR comments)
+      json  — Raw JSON (machine-readable, full schema)
+      html  — Self-contained HTML page (open in any browser)
+      sarif — SARIF 2.1.0 (GitHub Code Scanning integration)
+      junit — JUnit XML (Jenkins, Azure DevOps, CI dashboards)
     """
     import json
     from crucible.config import CrucibleConfig
-    from crucible.output.report import load_report, render_markdown
+    from crucible.output.report import (
+        load_report,
+        render_markdown,
+        render_html,
+        render_sarif,
+        render_junit_xml,
+    )
+
+    if fmt not in SUPPORTED_FORMATS:
+        raise ValueError(f"Unknown format '{fmt}'. Supported: {', '.join(SUPPORTED_FORMATS)}")
 
     cfg = CrucibleConfig.load(config_path)
     report = load_report(run_id, cfg.reports_dir)
     report_path = str(cfg.reports_dir / f"{run_id}.json")
 
-    if fmt == "json":
-        content = json.dumps(report, indent=2)
-    elif fmt == "md":
-        content = render_markdown(report)
-    elif fmt == "html":
-        md = render_markdown(report)
-        content = f"<pre>{md}</pre>"
-    else:
-        raise ValueError(f"Unknown format: {fmt}. Use 'md', 'json', or 'html'.")
+    render_map = {
+        "json": lambda r: json.dumps(r, indent=2),
+        "md": render_markdown,
+        "html": render_html,
+        "sarif": render_sarif,
+        "junit": render_junit_xml,
+    }
+    content = render_map[fmt](report)
 
     return ReportResult(run_id=run_id, format=fmt, content=content, path=report_path)

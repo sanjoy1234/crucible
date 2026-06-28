@@ -328,11 +328,17 @@ def verify(run_id: str):
 
 @main.command()
 @click.argument("run_id")
-@click.option("--format", "fmt", default="md", type=click.Choice(["md", "json", "html"]))
-def report(run_id: str, fmt: str):
-    """Render a stored Resilience Report."""
+@click.option(
+    "--format", "fmt", default="md",
+    type=click.Choice(["md", "json", "html", "sarif", "junit"]),
+    show_default=True,
+    help="Output format: md (default), json, html, sarif (GitHub Code Scanning), junit (CI dashboards)",
+)
+@click.option("--out", default=None, help="Write output to file instead of stdout")
+def report(run_id: str, fmt: str, out: str | None):
+    """Render a stored Resilience Report in any output format."""
     cfg = CrucibleConfig.load()
-    from .output.report import load_report, render_markdown
+    from .output.report import load_report, render_markdown, render_html, render_sarif, render_junit_xml
 
     try:
         r = load_report(run_id, cfg.reports_dir)
@@ -341,11 +347,21 @@ def report(run_id: str, fmt: str):
         sys.exit(1)
 
     if fmt == "json":
-        click.echo(json.dumps(r, indent=2))
+        content = json.dumps(r, indent=2)
     elif fmt == "md":
-        click.echo(render_markdown(r))
+        content = render_markdown(r)
+    elif fmt == "html":
+        content = render_html(r)
+    elif fmt == "sarif":
+        content = render_sarif(r)
+    else:  # junit
+        content = render_junit_xml(r)
+
+    if out:
+        Path(out).write_text(content)
+        console.print(f"[green]✓[/green]  Report written to {out}")
     else:
-        console.print(f"HTML export coming in week 2. JSON saved at {cfg.reports_dir}/{run_id}.json")
+        click.echo(content)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

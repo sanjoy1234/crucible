@@ -1,5 +1,11 @@
 # CRUCIBLE ⚔️
 
+[![Tests](https://img.shields.io/badge/tests-101%20passing-brightgreen)](https://github.com/sanjoy1234/crucible/actions)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://pypi.org/project/crucible-ai/)
+[![PyPI](https://img.shields.io/pypi/v/crucible-ai)](https://pypi.org/project/crucible-ai/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![SARIF](https://img.shields.io/badge/output-SARIF%20%7C%20JUnit%20%7C%20HTML-informational)](https://github.com/sanjoy1234/crucible)
+
 **Adversarial Co-Generation Engine — the only system that tests AI-generated code while it is being written.**
 
 CRUCIBLE runs a **Builder** agent and a **Breaker** agent **concurrently** on the same specification via `asyncio.gather()`. The Builder implements. The Breaker attacks. The Arbiter scores every attack and produces an **Adversarial Resilience Score (ARS)** — a tamper-evident security signal that can block PR merges and satisfy SOC 2, NIST SSDF, and ISO 27001 audit requirements.
@@ -95,7 +101,7 @@ docker compose run crucible \
 | `crucible init` | Scaffold `.crucible.yml` with defaults |
 | `crucible stats --days 30 --learning-curve` | ARS trend, Forge cache hits, learning curve |
 | `crucible verify <run_id>` | Re-derive SHA-256 hash, confirm report authenticity |
-| `crucible report <run_id> --format md` | Render Resilience Report as Markdown |
+| `crucible report <run_id> --format md\|html\|json\|sarif\|junit` | Render Resilience Report (Markdown, HTML, SARIF, JUnit XML) |
 | `crucible prune --older-than 90d` | Remove expired reports |
 
 ---
@@ -179,16 +185,22 @@ src/crucible/
 
 ---
 
-## Roadmap
+## How CRUCIBLE Compares
 
-| Week | Milestone |
-|------|-----------|
-| Now | Python + OWASP Top 10 + Ollama + GitHub Action |
-| Week 2 | TypeScript support, HIPAA + FINRA playbooks |
-| Week 3 | Knowledge Forge v2, PR auto-creation (Forge Bot) |
-| Week 4 | ARS Leaderboard: AI coders benchmarked publicly |
-| Month 2 | Java/Go support, CombatPair-as-a-Service GitHub App |
-| Month 3 | Research paper: 500-issue SWE-bench ablation study |
+| Capability | Bandit / Semgrep | OpenHands | SWE-agent | Devin | OpenCode | Argus | **CRUCIBLE** |
+|-----------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Concurrent adversarial testing | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | **✅ Core primitive** |
+| Tests code *while being written* | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | **✅ asyncio.gather** |
+| Tamper-evident compliance artifact | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | **✅ SHA-256 + NIST SSDF** |
+| Cross-build adversarial memory | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | **✅ Knowledge Forge** |
+| Air-gapped / on-premises | ✅ | Partial | Partial | ✗ | ✅ | ✗ | **✅ Ollama default** |
+| CI/CD merge gate (hard block) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | **✅ fail_open: false** |
+| SARIF / JUnit / HTML output | Partial | ✗ | ✗ | ✗ | ✗ | ✗ | **✅ All formats** |
+| Regulatory domain playbooks | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | **✅ OWASP / HIPAA / FINRA** |
+
+> Bandit/Semgrep do static analysis only — no adversarial agents, no compliance artifact.
+> OpenHands, SWE-agent, Devin, and OpenCode generate code but test it sequentially after the fact.
+> Argus red-teams running agents, not the code they produce — a different domain.
 
 ---
 
