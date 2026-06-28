@@ -32,6 +32,12 @@ class ServiceConfig:
     )
     crucible_config_path: str | None = None
 
+    # RBAC
+    rbac_enabled: bool = field(
+        default_factory=lambda: os.environ.get("CRUCIBLE_RBAC_ENABLED", "false").lower() == "true"
+    )
+    github_org: str = field(default_factory=lambda: os.environ.get("GITHUB_ORG", ""))
+
     @classmethod
     def from_env(cls) -> "ServiceConfig":
         return cls()

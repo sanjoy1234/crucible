@@ -761,6 +761,50 @@ def dashboard(port: int, host: str, reload: bool):
 # ──────────────────────────────────────────────────────────────────────────────
 
 @main.command()
+@click.option("--port", default=8080, show_default=True, help="Port to listen on")
+@click.option("--host", default="0.0.0.0", show_default=True, help="Host to bind")
+@click.option("--reload", is_flag=True, help="Enable auto-reload (development only)")
+@click.option("--rbac/--no-rbac", default=False, show_default=True,
+              help="Enable GitHub team-based RBAC (requires GITHUB_ORG + team env vars)")
+def serve(port: int, host: str, reload: bool, rbac: bool):
+    """Start CRUCIBLE CPaaS (GitHub App webhook server)."""
+    try:
+        import uvicorn  # noqa: F401
+    except ImportError:
+        console.print("[red]Error:[/red] crucible serve requires FastAPI and Uvicorn.")
+        console.print("Install with: [bold]pip install crucible-ai[ui][/bold]")
+        sys.exit(1)
+
+    from .service.config import ServiceConfig
+    cfg = ServiceConfig.from_env()
+    errors = cfg.validate()
+    if errors:
+        console.print("[yellow]Warning: CPaaS not fully configured:[/yellow]")
+        for e in errors:
+            console.print(f"  · {e}")
+        console.print("Service will start but GitHub integration will be disabled.\n")
+
+    if rbac:
+        org = cfg.github_org
+        console.print(f"[cyan]RBAC enabled[/cyan] — GitHub org: {org or '(not set)'}")
+
+    console.print(f"\n[bold]CRUCIBLE CPaaS[/bold]")
+    console.print(f"  Webhook URL: http://{host}:{port}/webhook")
+    console.print(f"  Dashboard:   http://{host}:{port}/")
+    console.print(f"  Stop: Ctrl+C\n")
+
+    import uvicorn
+    uvicorn.run(
+        "crucible.dashboard.app:create_app",
+        factory=True,
+        host=host,
+        port=port,
+        reload=reload,
+        log_level="info",
+    )
+
+
+@main.command()
 @click.option("--jsonl", "jsonl_path", type=click.Path(), default=None,
               help="Path to JSONL file with agent scores (agent_name, task_id, ars_score per line)")
 @click.option("--reports-dir", type=click.Path(), default=None,
