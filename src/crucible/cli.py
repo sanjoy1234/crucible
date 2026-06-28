@@ -536,6 +536,79 @@ def policy_validate(domain: str):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# crucible vault
+# ──────────────────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.option("--stats", "show_stats", is_flag=True, default=False,
+              help="Show vault statistics (entry counts, top CWEs, avg effectiveness)")
+@click.option("--cwe", default=None, help="Filter listing by CWE category (e.g. CWE-89)")
+@click.option("--format", "fmt", default="text", type=click.Choice(["text", "json", "md"]),
+              show_default=True, help="Output format")
+@click.option("--vault-dir", default=".crucible/vault", show_default=True,
+              help="Path to vault directory")
+def vault(show_stats: bool, cwe: str | None, fmt: str, vault_dir: str):
+    """Browse the Forge Ledger — human-readable Markdown adversarial memory vault."""
+    from .memory.forge_ledger import ForgeLedger
+    from pathlib import Path as _Path
+
+    ledger = ForgeLedger(vault_dir=_Path(vault_dir))
+
+    if show_stats:
+        s = ledger.stats()
+        if fmt == "json":
+            click.echo(json.dumps(s, indent=2))
+        elif fmt == "md":
+            click.echo(ledger.render_stats_markdown())
+        else:
+            console.print(f"\n[bold]Forge Ledger Stats[/bold]  ({vault_dir})\n")
+            console.print(f"  Total entries:        {s['total_entries']}")
+            console.print(f"  Avg effectiveness:    {s['avg_effectiveness']:.3f}")
+            if s["top_cwes"]:
+                console.print(f"  Top CWEs:             {', '.join(s['top_cwes'])}")
+            if s["severity_counts"]:
+                sev = "  ".join(f"{k}: {v}" for k, v in s["severity_counts"].items())
+                console.print(f"  Severity:             {sev}")
+            console.print("")
+        return
+
+    entries = ledger.list_entries(cwe_filter=cwe)
+    if not entries:
+        console.print(f"No vault entries found{' for ' + cwe if cwe else ''}.")
+        return
+
+    if fmt == "json":
+        click.echo(json.dumps([
+            {"cwe": e.cwe, "attack_id": e.attack_id, "title": e.title,
+             "severity": e.severity, "effectiveness": e.effectiveness,
+             "run_id": e.run_id, "recorded_at": e.recorded_at}
+            for e in entries
+        ], indent=2))
+    elif fmt == "md":
+        lines = [f"# Forge Ledger — {len(entries)} entries\n"]
+        for e in entries:
+            lines.append(f"- **[{e.cwe}]** {e.title} — eff: {e.effectiveness:.2f} ({e.severity})")
+        click.echo("\n".join(lines))
+    else:
+        table = Table(show_header=True, header_style="bold",
+                      title=f"Forge Ledger ({len(entries)} entries)")
+        table.add_column("CWE", style="bold", width=10)
+        table.add_column("Title", width=40)
+        table.add_column("Sev", width=8)
+        table.add_column("Eff", justify="right", width=6)
+        table.add_column("Run", style="dim", width=10)
+
+        for e in entries:
+            eff_style = "green" if e.effectiveness >= 1.0 else "yellow" if e.effectiveness >= 0.5 else "red"
+            table.add_row(
+                e.cwe, e.title[:38], e.severity,
+                f"[{eff_style}]{e.effectiveness:.2f}[/{eff_style}]",
+                e.run_id[-8:],
+            )
+        console.print(table)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # crucible prune
 # ──────────────────────────────────────────────────────────────────────────────
 

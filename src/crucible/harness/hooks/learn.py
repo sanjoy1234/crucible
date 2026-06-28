@@ -6,27 +6,40 @@ from ..runner import RunContext
 
 
 async def forge_write(ctx: RunContext) -> None:
-    """Write all attacks from this run into the Knowledge Forge."""
+    """Write all attacks from this run into the Knowledge Forge and Forge Ledger."""
     if ctx.result is None:
         return
 
     from ...memory.forge import KnowledgeForge
+    from ...memory.forge_ledger import ForgeLedger
 
     forge = KnowledgeForge()
-    if not forge.is_available():
-        return
-
+    ledger = ForgeLedger()
     fp = ctx.metadata.get("codebase_fingerprint", "")
+
     for attack in ctx.result.all_attacks:
-        forge.store_attack(
-            attack_id=attack.id,
-            description=attack.description,
+        if forge.is_available():
+            forge.store_attack(
+                attack_id=attack.id,
+                description=attack.description,
+                cwe=attack.cwe,
+                severity=attack.severity,
+                run_id=ctx.run_id,
+                effectiveness=attack.score,
+                codebase_fingerprint=fp,
+            )
+        ledger.write_entry(
             cwe=attack.cwe,
+            attack_id=attack.id,
+            title=attack.title,
+            description=attack.description,
             severity=attack.severity,
-            run_id=ctx.run_id,
             effectiveness=attack.score,
-            codebase_fingerprint=fp,
+            run_id=ctx.run_id,
+            fingerprint=fp,
         )
+
+    ctx.metadata["ledger_entries_written"] = len(ctx.result.all_attacks)
 
 
 async def effectiveness_update(ctx: RunContext) -> None:
