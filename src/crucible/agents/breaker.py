@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .base import AgentMessage, BaseAgent, ModelResponse
+from ..core.break_context import CompressionStats, compress_breaker_inputs
 
 BREAKER_SYSTEM = """\
 You are an elite offensive security engineer performing adversarial code review.
@@ -56,13 +57,21 @@ class BreakerResult:
     model_response: ModelResponse
     cwe_categories_used: list[str] = field(default_factory=list)
     round_number: int = 1
+    compression_stats: CompressionStats | None = None
 
 
 class Breaker(BaseAgent):
-    def __init__(self, cwe_rotation: bool = True, policy_context: str = "", **kwargs):
+    def __init__(
+        self,
+        cwe_rotation: bool = True,
+        policy_context: str = "",
+        break_context_enabled: bool = True,
+        **kwargs,
+    ):
         super().__init__(system_prompt=BREAKER_SYSTEM, **kwargs)
         self.cwe_rotation = cwe_rotation
         self.policy_context = policy_context
+        self.break_context_enabled = break_context_enabled
         self._cwe_pool = _load_cwe_pool()
         self._used_cwes: list[str] = []
 
@@ -81,20 +90,28 @@ class Breaker(BaseAgent):
             f"- {c}: {self._cwe_pool.get(c, 'Security vulnerability')}" for c in cwes
         )
 
+        # BreakContext: compress all three Breaker input channels
+        c_target, c_recall, c_cwe, stats = compress_breaker_inputs(
+            target=target,
+            recalled_attacks=recalled_attacks,
+            cwe_context=cwe_context,
+            enabled=self.break_context_enabled,
+        )
+
         policy_section = ""
         if self.policy_context:
             policy_section = f"\nCompliance context:\n{self.policy_context}\n"
 
         recalled_section = ""
-        if recalled_attacks:
+        if c_recall:
             recalled_section = (
                 f"\nHistorically effective attacks on similar codebases "
-                f"(from Knowledge Forge — consider these patterns first):\n{recalled_attacks}\n"
+                f"(from Knowledge Forge — consider these patterns first):\n{c_recall}\n"
             )
 
         prompt = (
-            f"Target (attack this):\n```\n{target}\n```\n\n"
-            f"Assigned CWE categories for this round:\n{cwe_context}"
+            f"Target (attack this):\n```\n{c_target}\n```\n\n"
+            f"Assigned CWE categories for this round:\n{c_cwe}"
             f"{policy_section}"
             f"{recalled_section}\n"
             f"Generate adversarial attacks. Return JSON array only."
@@ -109,6 +126,7 @@ class Breaker(BaseAgent):
             model_response=response,
             cwe_categories_used=cwes,
             round_number=round_number,
+            compression_stats=stats,
         )
 
     def _select_cwes(self, round_number: int) -> list[str]:

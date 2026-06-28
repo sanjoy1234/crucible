@@ -75,6 +75,7 @@ class CombatPair:
         self.breaker = Breaker(
             cwe_rotation=cp.cwe_rotation,
             policy_context=policy_context,
+            break_context_enabled=cp.break_context_enabled,
             **model_kwargs,
         )
         self.recalled_attacks = recalled_attacks

@@ -17,6 +17,7 @@ class CombatPairConfig:
     cwe_rotation: bool = True
     early_exit_threshold: float = 0.95
     early_exit_streak: int = 3
+    break_context_enabled: bool = True  # BreakContext token compression for Breaker input
 
 
 @dataclass
@@ -96,6 +97,7 @@ class CrucibleConfig:
                 cwe_rotation=cp.get("cwe_rotation", True),
                 early_exit_threshold=cp.get("early_exit_threshold", 0.95),
                 early_exit_streak=cp.get("early_exit_streak", 3),
+                break_context_enabled=cp.get("break_context_enabled", True),
             )
 
         if p := raw.get("policy"):
