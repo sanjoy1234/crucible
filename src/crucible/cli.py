@@ -725,6 +725,38 @@ def prune(older_than: str, dry_run: bool):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# crucible dashboard
+# ──────────────────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.option("--port", default=8080, show_default=True, help="Port to listen on")
+@click.option("--host", default="127.0.0.1", show_default=True, help="Host to bind")
+@click.option("--reload", is_flag=True, help="Enable auto-reload (development only)")
+def dashboard(port: int, host: str, reload: bool):
+    """Launch the Combat Dashboard web UI (requires pip install crucible-ai[ui])."""
+    try:
+        import uvicorn  # noqa: F401
+    except ImportError:
+        console.print("[red]Error:[/red] Combat Dashboard requires FastAPI and Uvicorn.")
+        console.print("Install with: [bold]pip install crucible-ai[ui][/bold]")
+        sys.exit(1)
+
+    console.print(f"\n[bold]CRUCIBLE Combat Dashboard[/bold]")
+    console.print(f"  URL:  [link=http://{host}:{port}]http://{host}:{port}[/link]")
+    console.print(f"  Stop: Ctrl+C\n")
+
+    import uvicorn
+    uvicorn.run(
+        "crucible.dashboard.app:create_app",
+        factory=True,
+        host=host,
+        port=port,
+        reload=reload,
+        log_level="warning",
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
