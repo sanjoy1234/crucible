@@ -757,6 +757,49 @@ def dashboard(port: int, host: str, reload: bool):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# crucible leaderboard
+# ──────────────────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.option("--jsonl", "jsonl_path", type=click.Path(), default=None,
+              help="Path to JSONL file with agent scores (agent_name, task_id, ars_score per line)")
+@click.option("--reports-dir", type=click.Path(), default=None,
+              help="Directory of CRUCIBLE report JSON files named <agent>--<task>.json")
+@click.option("--output", type=click.Path(), default="docs/leaderboard.html", show_default=True,
+              help="Output HTML file path (suitable for GitHub Pages docs/)")
+@click.option("--gate", default=0.80, show_default=True, help="ARS gate threshold")
+@click.option("--title", default="CRUCIBLE ARS Leaderboard", show_default=True,
+              help="Page title")
+def leaderboard(jsonl_path: str | None, reports_dir: str | None, output: str,
+                gate: float, title: str):
+    """Build and render the ARS Leaderboard HTML page."""
+    from .leaderboard.engine import (
+        load_agent_scores_from_jsonl,
+        load_agent_scores_from_reports,
+        build_leaderboard,
+        render_leaderboard_html,
+        save_leaderboard,
+    )
+    from datetime import datetime, timezone
+
+    scores = []
+    if jsonl_path:
+        scores += load_agent_scores_from_jsonl(Path(jsonl_path))
+    if reports_dir:
+        scores += load_agent_scores_from_reports(Path(reports_dir), gate)
+    if not jsonl_path and not reports_dir:
+        # default: try the standard reports dir
+        cfg = CrucibleConfig.load()
+        scores = load_agent_scores_from_reports(cfg.reports_dir, gate)
+
+    entries = build_leaderboard(scores, gate_threshold=gate)
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    html = render_leaderboard_html(entries, gate_threshold=gate, title=title, generated_at=generated_at)
+    save_leaderboard(html, Path(output))
+    console.print(f"[green]Leaderboard written to[/green] {output} ({len(entries)} agents, {len(scores)} tasks)")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
