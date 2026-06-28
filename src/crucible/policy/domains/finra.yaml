@@ -69,3 +69,36 @@ scenarios:
       timestamp manipulation (future-dated trades).
     regulatory_ref: CFTC Regulation 1.31 — Records; Keeping and Inspection
     example: "order.quantity = int(user_input) — no bounds check; accepts negative or astronomical values"
+
+  - id: finra-aml-detection
+    cwe: CWE-682
+    title: AML — Structuring Detection Bypass
+    description: >
+      Check for structuring threshold logic that can be bypassed: hard-coded
+      thresholds without cumulative tracking, missing aggregation across related
+      accounts, integer truncation in cumulative sum, and missing detection for
+      rapid sub-threshold transactions across the CTR window.
+    regulatory_ref: FINRA Rule 3310 — Anti-Money Laundering Compliance Program
+    example: "if transaction.amount >= 10000: flag_ctr() — misses 9,999 + 9,999 structuring pattern"
+
+  - id: finra-market-manipulation
+    cwe: CWE-284
+    title: Authorization Gap — Privileged Market Operations
+    description: >
+      Look for missing authorization on market-affecting operations: order
+      modification without trader identity verification, spoofing-enabling
+      bulk cancel without audit trail, wash trade detection gaps where
+      opposing orders from the same entity are not correlated.
+    regulatory_ref: FINRA Rule 2010 — Standards of Commercial Honor
+    example: "PUT /api/orders/modify — no check that requesting trader owns the order"
+
+  - id: finra-crypto-key
+    cwe: CWE-321
+    title: Cryptographic Key Management — Static Trading Keys
+    description: >
+      Check for static or embedded signing keys used for trade messages and
+      order authentication: hardcoded HMAC secrets, keys with no rotation
+      mechanism, missing key scoping (one key for all operations), and
+      absence of key derivation for per-session trade authentication.
+    regulatory_ref: FINRA Rule 4370 — Business Continuity, Cybersecurity
+    example: "TRADE_HMAC_SECRET = 'static-key-2019' in trading_auth.py — rotated? never."
