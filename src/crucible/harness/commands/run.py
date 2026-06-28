@@ -40,6 +40,7 @@ async def execute(
     from crucible.policy.engine import load_domains, combine_policy_context, list_available_domains
     from crucible.memory.forge import KnowledgeForge
     from crucible.brain.language_profiles import attack_context_for_spec
+    from crucible.brain.domain_intelligence import DomainIntelligenceAdapter
 
     cfg = CrucibleConfig.load(config_path)
     mode_counts = {"quick": 5, "standard": 20, "thorough": 50}
@@ -58,6 +59,11 @@ async def execute(
     lang_context = attack_context_for_spec(spec)
     if lang_context:
         policy_context = (policy_context + "\n\n" + lang_context).strip()
+
+    # DIA: enrich policy context with live MCP threat intelligence (best-effort)
+    if cfg.mcp_servers:
+        dia = DomainIntelligenceAdapter.from_config(cfg)
+        policy_context, _dia_results = dia.enrich(policy_context)
 
     forge = KnowledgeForge()
     recalled = ""

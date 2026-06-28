@@ -72,6 +72,7 @@ class CrucibleConfig:
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     retention_days: int = 365
     community_brain: bool = False
+    mcp_servers: list[dict] = field(default_factory=list)  # Domain Intelligence Adapter
 
     # resolved at load time
     reports_dir: Path = field(default_factory=lambda: Path(".crucible/reports"))
@@ -136,6 +137,7 @@ class CrucibleConfig:
 
         cfg.retention_days = raw.get("retention_days", 365)
         cfg.community_brain = raw.get("community_brain", False)
+        cfg.mcp_servers = raw.get("mcp_servers", [])
 
         # Env var overrides — order matters (most specific wins)
         if os.environ.get("OPENROUTER_API_KEY"):
