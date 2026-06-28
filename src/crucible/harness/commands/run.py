@@ -39,6 +39,7 @@ async def execute(
     from crucible.output.report import generate_run_id, build_report, save_report
     from crucible.policy.engine import load_domains, combine_policy_context, list_available_domains
     from crucible.memory.forge import KnowledgeForge
+    from crucible.brain.language_profiles import attack_context_for_spec
 
     cfg = CrucibleConfig.load(config_path)
     mode_counts = {"quick": 5, "standard": 20, "thorough": 50}
@@ -52,6 +53,11 @@ async def execute(
     policy_context = ""
     if valid_domains:
         policy_context = combine_policy_context(load_domains(valid_domains))
+
+    # Append language-specific attack context so Breaker prioritizes ecosystem CWEs
+    lang_context = attack_context_for_spec(spec)
+    if lang_context:
+        policy_context = (policy_context + "\n\n" + lang_context).strip()
 
     forge = KnowledgeForge()
     recalled = ""
