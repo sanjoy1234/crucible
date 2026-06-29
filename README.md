@@ -6,14 +6,14 @@
 
 **The only system that attacks AI-generated code while it is being written.**
 
-[![Tests](https://img.shields.io/badge/tests-342%20passing-brightgreen)](https://github.com/sanjoy1234/crucible/actions)
+[![Tests](https://img.shields.io/badge/tests-406%20passing-brightgreen)](https://github.com/sanjoy1234/crucible/actions)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://pypi.org/project/crucible-ai/)
 [![PyPI](https://img.shields.io/pypi/v/crucible-ai)](https://pypi.org/project/crucible-ai/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![SARIF 2.1](https://img.shields.io/badge/output-SARIF%202.1%20%7C%20JUnit%20%7C%20HTML-informational)](https://github.com/sanjoy1234/crucible)
 [![NIST SSDF](https://img.shields.io/badge/compliance-NIST%20SSDF%20%7C%20OWASP%20%7C%20HIPAA%20%7C%20FINRA-orange)](https://github.com/sanjoy1234/crucible)
 
-[**Quickstart**](#-five-minute-quickstart-zero-cost) · [**How It Works**](#-how-crucible-works) · [**Enterprise**](#-enterprise-features) · [**CLI Reference**](#-complete-cli-reference) · [**Compliance**](#-compliance--regulatory-domains) · [**Contributing**](#-contributing)
+[**Three Differentiators**](#what-crucible-is--and-the-three-things-that-make-it-different) · [**Quickstart**](#-five-minute-quickstart-zero-cost) · [**How It Works**](#-how-crucible-works) · [**Enterprise**](#-enterprise-features) · [**CLI Reference**](#-complete-cli-reference) · [**Compliance**](#-compliance--regulatory-domains) · [**Contributing**](#-contributing)
 
 ---
 
@@ -36,6 +36,144 @@ Or a FINRA examination flags an AML detection gap in a fraud scoring engine. The
 This is not hypothetical. It is happening across every regulated industry — finance, healthcare, government, insurance — right now, at scale.
 
 **The root cause is a distinction almost no one in the industry has named clearly.**
+
+---
+
+## What CRUCIBLE Is — and The Three Things That Make It Different
+
+CRUCIBLE is an **adversarial co-generation engine** for AI-written code. It does not scan code after it ships. It does not wait for a penetration test. It **attacks your specification simultaneously as the Builder writes code** — so by the time a PR exists, you already have an adversarial resilience score, a full attack breakdown, and a compliance artifact.
+
+Here are the three properties that make it structurally different from everything else in the AppSec landscape.
+
+---
+
+### ⚔️ 1. The Combat Pair — Builder and Breaker Run at the Same Instant
+
+Every AI coding tool today follows the same sequential pattern: generate code, run tests, maybe run a scanner. The security check happens after the code exists — and after the team has committed to shipping it.
+
+CRUCIBLE's architecture is different at the foundation. The **Builder** (generates code from the spec) and the **Breaker** (generates adversarial attacks from the same spec) are fired simultaneously via `asyncio.gather()`:
+
+```
+                         asyncio.gather()
+                ┌───────────────────────────────────────┐
+                │                                       │
+Spec ──────────►│  Builder ──────────────────► Code    │
+       │        │                                       │
+       └───────►│  Breaker → CWE attacks               │
+                │            → Arbiter scores each      │
+                │            → ARS = Σ(scores) / N      │
+                └───────────────────────────────────────┘
+                   Both start at t=0. Both finish together.
+```
+
+The Breaker does not read the generated code. It reads the **specification** — the same source of truth the Builder uses — and asks: *"Given what this code is supposed to do, what would a motivated attacker try?" * SQL injection, SSRF, broken authorization, deserialization attacks — 12 CWE categories, weighted by language and business domain.
+
+By the time the Builder finishes, you have code **and** an Adversarial Resilience Score **and** a tamper-evident Resilience Report. ARS below 0.80 with `fail_open: false` blocks the CI pipeline. Not an advisory. A hard gate.
+
+**This is not a feature you bolt onto a sequential code generator. The adversarial loop must be the architectural primitive — which is exactly what CRUCIBLE was designed as from the start.**
+
+[→ Deep dive: The Combat Pair engine](#how-crucible-works) · [Why concurrent matters](#-why-concurrent-matters--the-value-you-are-actually-getting)
+
+---
+
+### 🔌 2. A Ready-Made MCP Server — CRUCIBLE Lives Inside Your Coding Tool Today
+
+CRUCIBLE is a **full MCP (Model Context Protocol) server**. Any MCP-capable coding environment — Claude Code, Cursor, Windsurf, Zed — can call CRUCIBLE's adversarial engine directly, without leaving the IDE.
+
+**One config line to add it to Claude Code** (`~/.claude/mcp_servers.json`):
+
+```json
+{
+  "mcpServers": {
+    "crucible": { "command": "crucible", "args": ["mcp-server"] }
+  }
+}
+```
+
+Once added, five tools appear in your coding tool:
+
+```
+crucible_run         — fire adversarial assessment; returns run_id in <1s
+crucible_status      — poll for ARS score and attack breakdown
+crucible_vault_stats — how many adversarial patterns your Forge has learned
+crucible_policy_list — HIPAA, FINRA, PCI DSS, NIST SSDF, SOC 2 playbooks
+crucible_verify      — verify SHA-256 integrity of any Resilience Report
+```
+
+What this looks like in practice inside Claude Code:
+
+```
+You:        "Run a CRUCIBLE quick assessment on this payment API spec"
+
+CRUCIBLE:   Adversarial assessment started.
+            run_id: crucible-mcp-a1b2c3d4  (mode: quick — 5 attacks)
+
+            [~45 seconds later]
+
+You:        "Check results"
+
+CRUCIBLE:   ARS: 0.83  ✅ PASSED  (gate: ≥ 0.80)
+            Attacks: 5 total · 1 missed
+
+            ✅ CWE-89    SQL injection via login form        score: 1.0
+            ✅ CWE-79    Reflected XSS in error response     score: 1.0
+            ❌ CWE-918   SSRF via payment redirect URL       score: 0.0  ← missed
+            ✅ CWE-287   Broken auth — weak token entropy    score: 1.0
+            ✅ CWE-862   Missing object-level authorization  score: 1.0
+```
+
+The long-running engine (45s–12min) runs as a background `asyncio.Task`. The start/poll pattern keeps the IDE responsive. For team deployments, `crucible serve` exposes `POST /mcp` alongside the Combat Dashboard — configure the URL in your IDE and the whole team shares one CRUCIBLE instance.
+
+[→ Full MCP setup guide for all IDEs](#mcp-server-integration--use-crucible-inside-your-coding-tool)
+
+---
+
+### 🌐 3. The Domain Intelligence Adapter — Every Run Enriched with Live Threat Data
+
+The Breaker does not attack in a vacuum. Before each run, the **Domain Intelligence Adapter (DIA)** enriches its policy context with two layers of live intelligence:
+
+**Layer 1 — Live exploit feeds (CISA KEV + NIST NVD)**
+
+CRUCIBLE automatically queries the [CISA Known Exploited Vulnerabilities catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) (1,000+ CVEs with confirmed in-the-wild exploitation, free, no key) and the [NIST NVD API v2.0](https://nvd.nist.gov/developers/vulnerabilities) (optional, set `NVD_API_KEY`) to pull recent real-world CVEs matching the CWE categories being tested:
+
+```
+--- Live threat intelligence from CISA KEV ---
+CVE-2023-34362 (Progress MOVEit Transfer) [ransomware-linked] added:2023-06-01
+  SQL injection allows unauthenticated remote code execution
+
+CVE-2021-26855 (Microsoft Exchange Server) added:2021-03-02
+  Server-side request forgery allows unauthorized internal network access
+
+--- Live threat intelligence from NIST NVD ---
+Recent CWE-89 CVEs (847 total in NVD):
+  CVE-2024-28890 [HIGH 8.1] 2024-03-14: SQL injection in authentication endpoint ...
+```
+
+The Breaker uses this context to generate *timely, realistic* attack scenarios — not just textbook patterns. When MOVEit is fresh in the KEV feed, the Breaker's SQL injection payloads reflect how that specific class of vulnerability was actually exploited.
+
+**Layer 2 — Enterprise domain policies**
+
+Seven built-in compliance domain playbooks steer the Breaker toward domain-specific attack scenarios:
+
+| Domain | What the Breaker focuses on |
+|--------|-----------------------------|
+| `hipaa` | PHI exposure in error messages, audit log gaps, de-identification failures |
+| `finra` | AML detection bypass, audit trail tampering, broker-dealer auth gaps |
+| `pci_dss` | Cardholder data in logs, key management failures, scope creep |
+| `nist_ssdf` | Input validation (PW.4), dependency integrity, supply chain |
+| `owasp_top10` | Injection, broken auth, XSS, IDOR, SSRF, XXE |
+| `owasp_api_security` | BOLA, mass assignment, resource exhaustion |
+| `soc2` | Logical access, system operations, change management |
+
+Run with `domain: hipaa` and the Breaker attacks your healthcare API the way a compliance auditor — not a textbook — would.
+
+DIA also supports any external MCP server as a custom threat intel source — configurable in `.crucible.yml` under `mcp_servers:`.
+
+[→ DIA architecture details](#domain-intelligence-adapter)
+
+---
+
+> **Ready to try it? →** [Five-Minute Quickstart (zero cost)](#-five-minute-quickstart-zero-cost)
 
 ---
 
