@@ -884,6 +884,41 @@ def leaderboard(jsonl_path: str | None, reports_dir: str | None, output: str,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# crucible mcp-server
+# ──────────────────────────────────────────────────────────────────────────────
+
+@main.command("mcp-server")
+@click.option("--config", "config_path", default=None, help="Path to .crucible.yml")
+def mcp_server(config_path: str | None):
+    """
+    Start CRUCIBLE as an MCP server (stdio transport).
+
+    Exposes CRUCIBLE's adversarial assessment capabilities to any
+    MCP-compatible coding tool: Claude Code, Cursor, Windsurf, Zed, etc.
+
+    \b
+    Tools exposed:
+      crucible_run         — start adversarial assessment (returns run_id)
+      crucible_status      — poll for results by run_id
+      crucible_vault_stats — Knowledge Forge statistics
+      crucible_policy_list — list available security domains
+      crucible_verify      — verify SHA-256 report integrity
+
+    \b
+    Claude Code (~/.claude/mcp_servers.json):
+      { "crucible": { "command": "crucible", "args": ["mcp-server"] } }
+
+    \b
+    Cursor (.cursor/mcp.json):
+      { "crucible": { "command": "crucible", "args": ["mcp-server"] } }
+    """
+    from .mcp.server import MCPServer
+    cfg = CrucibleConfig.load(config_path)
+    server = MCPServer(config=cfg)
+    asyncio.run(server.run_stdio())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 

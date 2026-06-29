@@ -153,25 +153,35 @@ class DomainIntelligenceAdapter:
         ]
         return cls(servers)
 
-    def enrich(self, base_context: str) -> tuple[str, list[DiaResult]]:
+    def enrich(
+        self,
+        base_context: str,
+        cwe_ids: list[str] | None = None,
+        config: Any = None,
+    ) -> tuple[str, list[DiaResult]]:
         """
-        Call all configured MCP servers and append enrichment to base_context.
+        Enrich base_context with:
+          1. MCP server calls (existing DIA behaviour)
+          2. NIST NVD live CVE data (if config.nvd_enabled or NVD_API_KEY set)
+          3. CISA KEV active exploitation data (if config.kev_enabled, default on)
 
         Returns:
             (enriched_context, list_of_dia_results)
         """
-        if not self._servers:
-            return base_context, []
-
         results: list[DiaResult] = []
         enrichments: list[str] = []
 
+        # MCP server enrichment (existing)
         for server in self._servers:
             result = call_mcp_tool(server)
             results.append(result)
             if result.success and result.enrichment:
                 enrichments.append(result.enrichment)
                 logger.debug("DIA: enriched from '%s' (%d chars)", server.name, len(result.enrichment))
+
+        # Live REST API enrichment
+        if cwe_ids:
+            enrichments.extend(_enrich_from_live_apis(cwe_ids, config))
 
         if not enrichments:
             return base_context, results
@@ -184,6 +194,43 @@ class DomainIntelligenceAdapter:
 
     def available_servers(self) -> list[str]:
         return [s.name for s in self._servers if s.enabled]
+
+
+def _enrich_from_live_apis(cwe_ids: list[str], config: Any) -> list[str]:
+    """
+    Call NIST NVD and CISA KEV live REST APIs and return enrichment strings.
+
+    Both calls are best-effort — failures return empty strings silently.
+    config may be None (uses env-var defaults) or a CrucibleConfig instance.
+    """
+    enrichments: list[str] = []
+
+    # CISA KEV — default on, no API key needed
+    kev_enabled = getattr(config, "kev_enabled", True) if config is not None else True
+    if kev_enabled:
+        try:
+            from .kev_client import KevClient
+            kev_text = KevClient().get_exploited_for_cwes(cwe_ids)
+            if kev_text:
+                enrichments.append(kev_text)
+        except Exception as e:
+            logger.debug("DIA: KEV enrichment failed: %s", e)
+
+    # NIST NVD — opt-in (requires NVD_API_KEY for reasonable rate limits)
+    import os
+    nvd_enabled = getattr(config, "nvd_enabled", False) if config is not None else False
+    nvd_via_key = bool(os.environ.get("NVD_API_KEY"))
+    if nvd_enabled or nvd_via_key:
+        try:
+            from .nvd_client import NvdClient
+            lookback = getattr(config, "nvd_lookback_days", 90) if config is not None else 90
+            nvd_text = NvdClient().get_recent_cves(cwe_ids, lookback_days=lookback)
+            if nvd_text:
+                enrichments.append(nvd_text)
+        except Exception as e:
+            logger.debug("DIA: NVD enrichment failed: %s", e)
+
+    return enrichments
 
 
 def parse_mcp_servers_from_yaml(raw: list[dict]) -> list[McpServerConfig]:

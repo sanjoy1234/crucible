@@ -74,6 +74,11 @@ class CrucibleConfig:
     community_brain: bool = False
     mcp_servers: list[dict] = field(default_factory=list)  # Domain Intelligence Adapter
 
+    # Live threat intelligence — REST API enrichment (no API key required for KEV)
+    nvd_enabled: bool = False   # NIST NVD API v2.0; set NVD_API_KEY env var for higher rate limits
+    kev_enabled: bool = True    # CISA Known Exploited Vulnerabilities feed (free, no key needed)
+    nvd_lookback_days: int = 90  # How many days back to query NVD (default: 90 days)
+
     # resolved at load time
     reports_dir: Path = field(default_factory=lambda: Path(".crucible/reports"))
 
@@ -138,6 +143,9 @@ class CrucibleConfig:
         cfg.retention_days = raw.get("retention_days", 365)
         cfg.community_brain = raw.get("community_brain", False)
         cfg.mcp_servers = raw.get("mcp_servers", [])
+        cfg.nvd_enabled = raw.get("nvd_enabled", False)
+        cfg.kev_enabled = raw.get("kev_enabled", True)
+        cfg.nvd_lookback_days = raw.get("nvd_lookback_days", 90)
 
         # Env var overrides — order matters (most specific wins)
         if os.environ.get("OPENROUTER_API_KEY"):

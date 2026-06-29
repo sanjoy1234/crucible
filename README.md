@@ -1749,6 +1749,135 @@ deployment:
   local_model: llama3.1:8b   # or: llama3.3:70b, mistral:7b, codellama:34b
 ```
 
+### MCP Server Integration — Use CRUCIBLE Inside Your Coding Tool
+
+CRUCIBLE implements the **MCP (Model Context Protocol) server** protocol, exposing its full adversarial assessment engine as tools that any MCP-compatible coding tool can call — Claude Code, Cursor, Windsurf, Zed, and any other IDE that speaks JSON-RPC 2.0.
+
+**Two deployment modes:**
+
+| Mode | Command | Best for |
+|------|---------|---------|
+| **stdio** (local) | `crucible mcp-server` | Individual developer — IDE communicates over stdin/stdout |
+| **HTTP** (team) | `crucible serve` → POST `/mcp` | Team deployment — shared server on internal network |
+
+#### Individual: Claude Code (`~/.claude/mcp_servers.json`)
+
+```json
+{
+  "mcpServers": {
+    "crucible": {
+      "command": "crucible",
+      "args": ["mcp-server"]
+    }
+  }
+}
+```
+
+After adding this, Claude Code will discover five new tools:
+
+```
+crucible_run         — start adversarial assessment (returns run_id in <1s)
+crucible_status      — poll for results by run_id
+crucible_vault_stats — Knowledge Forge statistics (adversarial pattern library)
+crucible_policy_list — list available security domains (HIPAA, FINRA, PCI DSS, etc.)
+crucible_verify      — verify SHA-256 integrity of a stored Resilience Report
+```
+
+#### Individual: Cursor (`.cursor/mcp.json`)
+
+```json
+{
+  "crucible": {
+    "command": "crucible",
+    "args": ["mcp-server"]
+  }
+}
+```
+
+#### Individual: Windsurf (`.windsurf/mcp.json`)
+
+```json
+{
+  "mcpServers": {
+    "crucible": {
+      "command": "crucible",
+      "args": ["mcp-server"]
+    }
+  }
+}
+```
+
+#### Team: HTTP transport (with Combat Dashboard)
+
+```bash
+# Deploy once — teams share a single CRUCIBLE instance
+crucible serve --host 0.0.0.0 --port 8080
+
+# Each developer's IDE config points at the shared server
+# MCP HTTP client config:
+# { "crucible": { "url": "http://crucible.internal:8080/mcp" } }
+```
+
+#### What this looks like in practice
+
+Once configured, you can invoke CRUCIBLE from a natural-language prompt inside your coding tool:
+
+```
+You: "Run a CRUCIBLE adversarial assessment on this payment API spec (quick mode)"
+
+Claude Code (using crucible_run): → run_id: crucible-mcp-a1b2c3d4, status: started
+
+You: "Check results"
+
+Claude Code (using crucible_status): → ARS: 0.83 ✅ PASSED (gate: ≥0.80)
+  Attacks: 5 total · 1 missed
+  ✅ CWE-89       SQL injection              score:1.0
+  ✅ CWE-79       Reflected XSS              score:1.0
+  ❌ CWE-918      SSRF via redirect          score:0.0  ← missed
+  ✅ CWE-287      Broken authentication      score:1.0
+  ✅ CWE-862      Missing authorization      score:1.0
+```
+
+#### Why start/poll instead of blocking?
+
+CRUCIBLE's adversarial engine runs for 45 seconds (quick) to 12 minutes (thorough). MCP's HTTP transport has a sub-second timeout for interactive use. The solution: `crucible_run` fires an `asyncio.Task` and returns the `run_id` immediately; `crucible_status` polls until the background task completes. This gives the IDE a fluid experience without blocking the event loop.
+
+#### Live threat intelligence in MCP runs
+
+When CRUCIBLE runs via MCP, it still enriches the Breaker with live threat intelligence from CISA KEV and NIST NVD (if configured):
+
+```bash
+# CISA KEV — always on, free, no key needed
+# Reports actively exploited vulnerabilities matching your test's CWE categories
+
+# NIST NVD — opt-in (set NVD_API_KEY for higher rate limits)
+export NVD_API_KEY=your-key-here   # free at nvd.nist.gov/developers/request-an-api-key
+```
+
+#### Available CRUCIBLE tools via MCP
+
+```
+Tool: crucible_run
+  spec     (required) — feature spec, GitHub issue, user story, or API contract text
+  mode     (optional) — "quick" (45s), "standard" (3min), "thorough" (12min)
+  domain   (optional) — security domain: owasp_top10, hipaa, finra, pci_dss, soc2, nist_ssdf
+  language (optional) — python, javascript, typescript, java, go (auto-detected if omitted)
+
+Tool: crucible_status
+  run_id   (required) — the run_id returned by crucible_run
+
+Tool: crucible_vault_stats
+  (no arguments) — returns total adversarial patterns in the Knowledge Forge
+
+Tool: crucible_policy_list
+  (no arguments) — lists all 7 available security domain playbooks
+
+Tool: crucible_verify
+  run_id   (required) — verify SHA-256 integrity of a completed run's Resilience Report
+```
+
+---
+
 ### Domain Intelligence Adapter
 
 CRUCIBLE consumes live threat intelligence from [MCP (Model Context Protocol)](https://modelcontextprotocol.io) servers, enriching the Breaker's policy context before each run with real-time feeds.
@@ -1762,7 +1891,7 @@ mcp_servers:
     enabled: true
 ```
 
-Note: CRUCIBLE is a *consumer* of MCP servers. It does not implement the MCP server protocol (its 60–90s runtime is architecturally incompatible with MCP's sub-second response contract).
+Note: CRUCIBLE is *both* an MCP server (see "MCP Server Integration" above) and an MCP consumer. As a server it uses start/poll to handle the long runtime; as a consumer it enriches the Breaker with live threat feeds from external MCP servers configured here.
 
 ### ARS Leaderboard — Benchmarking AI Coding Agents
 

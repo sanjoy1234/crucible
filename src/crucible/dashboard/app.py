@@ -20,7 +20,7 @@ from pathlib import Path
 
 # Guard against FastAPI/Uvicorn not being installed
 try:
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import HTMLResponse, JSONResponse, Response
     _FASTAPI_AVAILABLE = True
 except ImportError:
@@ -121,6 +121,38 @@ def create_app(config: CrucibleConfig | None = None) -> "FastAPI":
     @app.get("/health")
     async def health():
         return {"status": "ok", "service": "crucible-dashboard"}
+
+    # ── MCP HTTP endpoint (JSON-RPC 2.0) ──────────────────────────────────────
+    # Serves CRUCIBLE as an MCP server over HTTP for team/enterprise deployment.
+    # Individual developers use stdio transport (`crucible mcp-server`).
+    # Team deploy: `crucible serve` exposes POST /mcp alongside the dashboard.
+    #
+    # Client config (HTTP transport):
+    #   { "crucible": { "url": "http://your-server:8080/mcp" } }
+
+    from ..mcp.server import MCPServer as _MCPServer
+
+    _mcp_server = _MCPServer(config=cfg)
+
+    @app.post("/mcp")
+    async def mcp_endpoint(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}},
+                status_code=400,
+            )
+        response = await _mcp_server.handle_http_request(body)
+        return JSONResponse(response)
+
+    @app.get("/mcp/tools")
+    async def mcp_tools_list():
+        """Convenience GET — returns the tool list without a JSON-RPC envelope."""
+        response = await _mcp_server.handle_message({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {},
+        })
+        return JSONResponse(response.get("result", {}).get("tools", []))
 
     return app
 

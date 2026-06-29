@@ -1,0 +1,1 @@
+"""CRUCIBLE MCP Server package."""
