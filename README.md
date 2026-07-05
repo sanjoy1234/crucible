@@ -6,7 +6,7 @@
 
 **The only system that attacks AI-generated code while it is being written.**
 
-[![Tests](https://img.shields.io/badge/tests-406%20passing-brightgreen)](https://github.com/sanjoy1234/crucible/actions)
+[![Tests](https://img.shields.io/badge/tests-476%20passing-brightgreen)](https://github.com/sanjoy1234/crucible/actions)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://pypi.org/project/crucible-ai/)
 [![PyPI](https://img.shields.io/pypi/v/crucible-ai)](https://pypi.org/project/crucible-ai/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -36,6 +36,26 @@ Or a FINRA examination flags an AML detection gap in a fraud scoring engine. The
 This is not hypothetical. It is happening across every regulated industry — finance, healthcare, government, insurance — right now, at scale.
 
 **The root cause is a distinction almost no one in the industry has named clearly.**
+
+---
+
+## If Your Team Adopted TDD, You Already Understand Why CRUCIBLE Exists
+
+Engineering managers who shipped the TDD transition remember the argument: *"We don't have time to write tests."* Then they measured what "no time" actually cost — defects found in QA cost 10× more than defects found in development; defects found in production cost 100× more. Once those numbers were on the table, the conversation changed. TDD was not a cost — it was the cheapest defect-removal process available at the point of creation.
+
+CRUCIBLE applies the same logic to adversarial security:
+
+| | TDD | CRUCIBLE |
+|---|---|---|
+| **What it attacks** | Functional defects | Security weaknesses |
+| **When it runs** | While code is written | While code is generated |
+| **What it costs** | ~43s per run | ~43s per run |
+| **What it prevents** | Broken features in QA | Exploitable code in production |
+| **Artifact produced** | Test suite | Adversarial Resilience Score + compliance evidence |
+
+A `crucible run` adds roughly 43 seconds to a PR. A HIPAA breach investigation adds roughly 8 months. The math is the same math TDD made obvious — **the cost of finding a security gap at the point of creation is near zero compared to the cost of finding it in production.**
+
+The difference is that TDD requires a human to write the test cases. CRUCIBLE generates adversarial attacks from your specification automatically, using the same source of truth your AI coding tool is already reading.
 
 ---
 
@@ -620,31 +640,27 @@ CRUCIBLE's claim is specific: **for AI-generated code, the moment of generation 
 
 ---
 
-## ⚡ Five-Minute Quickstart (Zero Cost)
-
-CRUCIBLE runs completely locally on [Ollama](https://ollama.ai). No API key. No signup.
+## ⚡ Five-Minute Quickstart
 
 ```bash
-# 1. Install Ollama and pull a model
-curl -fsSL https://ollama.ai/install.sh | sh
-ollama pull llama3.1:8b
-
-# 2. Install CRUCIBLE
+# 1. Install CRUCIBLE
 pip install crucible-ai
 
-# 3. Initialize project config
-crucible init
+# 2. Interactive setup — picks and validates the best model for your environment
+crucible setup
 
-# 4. Run on the included demo spec
+# 3. Run on the included demo spec
 crucible run --issue examples/demo_issue.md --mode quick --pretty
 ```
 
-**Expected output — 43 seconds, $0.00:**
+`crucible setup` detects what's available (Ollama locally, OpenRouter free tier, or your own API keys) and writes a `.crucible.yml` with the fastest, most reliable model for your environment. No manual configuration.
+
+**Expected output — 43 seconds:**
 
 ```
 ──────────────────────────────────────────────────────────────────────
   CRUCIBLE Adversarial Run
-  Run ID:    crucible-2026-06-28T12-00-00Z-a3f9
+  Run ID:    crucible-2026-07-04T12-00-00Z-a3f9
   Mode:      quick (5 attacks)
   Language:  python  [signals: filesystem, async]
   Domain:    owasp_top10
@@ -659,23 +675,25 @@ crucible run --issue examples/demo_issue.md --mode quick --pretty
   ❌ CWE-79  Reflected XSS in error message      score: 0.0  MISSED
 
   Elapsed:  43.2s
-  Report:   .crucible/reports/crucible-2026-06-28T12-00-00Z-a3f9.json
+  Report:   .crucible/reports/crucible-2026-07-04T12-00-00Z-a3f9.json
   Ledger:   .crucible/vault/CWE-79/a3f9-atk-001-xss-reflected.md
 ──────────────────────────────────────────────────────────────────────
 ```
 
 ---
 
-## 🔑 Quickstart — Anthropic API
+### Model Options
 
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-crucible run --issue examples/demo_issue.md --mode quick --pretty
+| Provider | Cost | Latency | Setup |
+|----------|------|---------|-------|
+| **OpenRouter free tier** (`openai/gpt-oss-20b:free`) | $0.00 | ~45s | `export OPENROUTER_API_KEY=...` |
+| **Ollama (local)** (`llama3.1:8b` or better) | $0.00 | ~60s | `ollama pull llama3.1:8b` |
+| **Anthropic API** (Claude Sonnet) | ~$0.08/run | ~15s | `export ANTHROPIC_API_KEY=...` |
+| **OpenAI API** | ~$0.10/run | ~20s | `export OPENAI_API_KEY=...` |
 
-# quick mode  (5 attacks):  ~$0.08  ~15s
-# standard    (20 attacks): ~$0.30  ~60s
-# thorough    (50 attacks): ~$0.75  ~3min
-```
+`crucible setup` detects and validates whichever you have. The free OpenRouter tier (`openai/gpt-oss-20b:free`) is recommended for first-time users — no credit card, reliable output.
+
+---
 
 ## 🔗 Quickstart — From a GitHub Issue URL
 

@@ -109,7 +109,15 @@ class ForgeLedger:
         slug = _slugify(title)
         filename = f"{run_id[-8:]}-{attack_id}-{slug}.md"
         path = cwe_dir / filename
-        path.write_text(_entry_to_markdown(entry), encoding="utf-8")
+        # File lock prevents corruption when multiple crucible runs write concurrently
+        import fcntl
+        lock_path = cwe_dir / ".write.lock"
+        with open(lock_path, "w") as lf:
+            try:
+                fcntl.flock(lf, fcntl.LOCK_EX)
+                path.write_text(_entry_to_markdown(entry), encoding="utf-8")
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
         return path
 
     def list_entries(self, cwe_filter: str | None = None) -> list[LedgerEntry]:

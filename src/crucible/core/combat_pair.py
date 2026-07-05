@@ -65,6 +65,7 @@ class CombatPair:
         config: CrucibleConfig | None = None,
         recalled_attacks: str = "",
         policy_context: str = "",
+        intent_context: str = "",
     ):
         self.config = config or CrucibleConfig()
         cp = self.config.combat_pair
@@ -79,6 +80,7 @@ class CombatPair:
             **model_kwargs,
         )
         self.recalled_attacks = recalled_attacks
+        self.intent_context = intent_context
         self._rounds_max = cp.rounds_max
         self._early_exit_threshold = cp.early_exit_threshold
         self._early_exit_streak = cp.early_exit_streak
@@ -103,6 +105,7 @@ class CombatPair:
                     target,
                     round_number=round_num,
                     recalled_attacks=self.recalled_attacks if round_num == 1 else "",
+                    intent_context=self.intent_context if round_num == 1 else "",
                 ),
             )
 
@@ -111,7 +114,9 @@ class CombatPair:
             if round_num > 1:
                 # Re-attack the new build synchronously (Breaker already ran on prev build)
                 breaker_result = await self.breaker.attack(
-                    build_result.code, round_number=round_num
+                    build_result.code,
+                    round_number=round_num,
+                    intent_context=self.intent_context,
                 )
 
             round_ars = arbiter.score_round(build_result, breaker_result)

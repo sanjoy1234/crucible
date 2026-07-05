@@ -9,12 +9,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import sys
+import time
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 import click
 from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 # Auto-load .env if present — lets users set OPENROUTER_API_KEY etc. without
 # manually exporting. dotenv is a no-op when the file doesn't exist.
@@ -27,6 +35,175 @@ except ImportError:
 from .config import CrucibleConfig, DEFAULT_CONFIG_YAML
 
 console = Console()
+
+_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+
+@dataclass
+class _RunProgress:
+    run_id: str = ""
+    issue_label: str = ""
+    mode: str = ""
+    attack_total: int = 0
+    # phases: init → loading → combat → scoring → saving → done | error
+    phase: str = "init"
+    spec_bytes: int = 0
+    combat_start: float = 0.0
+    attacks_scored: int = 0
+    current_attack_cwe: str = ""
+    current_attack_title: str = ""
+    completed_attacks: list[tuple[str, str, str]] = field(default_factory=list)
+    error: str = ""
+    attack_start: float = 0.0
+    _tick: int = 0
+
+    def spinner(self) -> str:
+        self._tick += 1
+        return _SPINNER_FRAMES[self._tick % len(_SPINNER_FRAMES)]
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s // 60}m {s % 60:02d}s" if s >= 60 else f"{s}s"
+
+
+def _verdict_style(verdict: str) -> str:
+    return {"MITIGATED": "green", "PARTIAL": "yellow", "MISSED": "red"}.get(verdict, "dim")
+
+
+def _render_live_panel(state: _RunProgress) -> Panel:
+    lines: list[str] = []
+
+    def _phase_row(num: int, label: str, detail: str = "", active: bool = False, done: bool = False) -> str:
+        icon = state.spinner() if active else ("✓" if done else "·")
+        col = "cyan" if active else ("green" if done else "dim")
+        det = f"  [dim]{detail}[/dim]" if detail else ""
+        return f"  [{col}][{num}/4] {icon}[/{col}]  {label}{det}"
+
+    spec_done = state.phase not in ("init", "loading")
+    combat_done = state.phase in ("scoring", "saving", "done")
+    scoring_done = state.phase in ("saving", "done")
+    save_done = state.phase == "done"
+
+    # Phase 1 — Spec
+    if state.phase == "loading":
+        lines.append(_phase_row(1, "Loading spec...", state.issue_label, active=True))
+    elif spec_done:
+        size = f"{state.spec_bytes // 1024}KB" if state.spec_bytes >= 1024 else f"{state.spec_bytes}B"
+        lines.append(_phase_row(1, "Spec loaded", f"{state.issue_label}  ({size})", done=True))
+    else:
+        lines.append(_phase_row(1, "Load spec", state.issue_label))
+
+    # Phase 2 — Combat
+    if state.phase == "combat":
+        elapsed = _fmt_elapsed(time.monotonic() - state.combat_start)
+        lines.append(_phase_row(2, "Builder + Breaker  [dim]running concurrently[/dim]", elapsed, active=True))
+        lines.append(f"      [dim]├─[/dim] [blue]Builder:[/blue]  generating secure implementation")
+        lines.append(f"      [dim]└─[/dim] [red]Breaker:[/red]  generating adversarial attack vectors")
+    elif combat_done:
+        lines.append(_phase_row(2, "Builder + Breaker", "complete", done=True))
+    else:
+        lines.append(_phase_row(2, "Builder + Breaker", "concurrent LLM calls"))
+
+    # Phase 3 — Arbiter scoring
+    if state.phase == "scoring":
+        prog = f"{state.attacks_scored}/{state.attack_total}"
+        lines.append(_phase_row(3, f"Arbiter scoring attacks  [dim]{prog}[/dim]", active=True))
+        vdict = {"MITIGATED": "✓", "PARTIAL": "~", "MISSED": "✗"}
+        for cwe, title, verdict in state.completed_attacks:
+            col = _verdict_style(verdict)
+            lines.append(f"      [{col}]{vdict.get(verdict,'·')}  {cwe:<10}[/{col}] [dim]{title[:45]}[/dim]  [{col}]{verdict}[/{col}]")
+        if state.current_attack_cwe:
+            atk_elapsed = f" ({_fmt_elapsed(time.monotonic() - state.attack_start)})" if state.attack_start else ""
+            lines.append(f"      [cyan]{state.spinner()}  {state.current_attack_cwe:<10}[/cyan] [dim]{state.current_attack_title[:45]}[/dim]  [dim]scoring...{atk_elapsed}[/dim]")
+        remaining = state.attack_total - state.attacks_scored - (1 if state.current_attack_cwe else 0)
+        for _ in range(max(0, remaining)):
+            lines.append(f"      [dim]·  {'—':<10} —[/dim]")
+    elif scoring_done:
+        lines.append(_phase_row(3, "Arbiter scoring", f"{state.attacks_scored} attacks scored", done=True))
+    else:
+        lines.append(_phase_row(3, "Arbiter scoring", f"{state.attack_total} attacks"))
+
+    # Phase 4 — Save report
+    if state.phase == "saving":
+        lines.append(_phase_row(4, "Saving report...", active=True))
+    elif save_done:
+        lines.append(_phase_row(4, "Report saved", done=True))
+    else:
+        lines.append(_phase_row(4, "Save report"))
+
+    if state.error:
+        lines.append(f"\n  [red]✗ Error:[/red] {state.error}")
+
+    header = (
+        f"[bold cyan]⚔  CRUCIBLE[/bold cyan]  [dim]{state.run_id}[/dim]\n"
+        f"  Mode: [cyan]{state.mode}[/cyan]  ·  Attacks: {state.attack_total or '?'}  ·  Repo: [dim]{state.issue_label}[/dim]"
+    )
+    body = header + "\n" + "─" * 68 + "\n" + "\n".join(lines)
+    return Panel(Text.from_markup(body), border_style="blue", padding=(0, 1))
+
+
+@asynccontextmanager
+async def _live_ticker(live: "Live", render_fn, interval: float = 0.25):
+    """Keep re-rendering `render_fn()` into `live` while the wrapped block runs, so
+    a slow model call still shows a moving spinner and elapsed time instead of
+    freezing the panel."""
+    stop = asyncio.Event()
+
+    async def _tick():
+        while not stop.is_set():
+            live.update(render_fn())
+            await asyncio.sleep(interval)
+
+    task = asyncio.create_task(_tick())
+    try:
+        yield
+    finally:
+        stop.set()
+        await task
+
+
+async def _await_with_heartbeat(coro, plain_fn, interval: float = 20.0):
+    """Await `coro`, printing a heartbeat via `plain_fn` every `interval` seconds
+    while it's still running — so a slow model call never looks like a hang."""
+    task = asyncio.ensure_future(coro)
+    waited = 0.0
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=interval)
+        if task in done:
+            return await task
+        waited += interval
+        plain_fn(f"      ... still waiting on model response ({_fmt_elapsed(waited)})")
+
+
+def _write_run_status(run_id: str, runs_dir: Path, **fields) -> None:
+    """Write/update a status.json for a background or in-progress run."""
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    status_file = runs_dir / f"{run_id}.json"
+    existing: dict = {}
+    if status_file.exists():
+        try:
+            existing = json.loads(status_file.read_text())
+        except Exception:
+            pass
+    existing.update({"run_id": run_id, "updated_at": datetime.now(timezone.utc).isoformat(), **fields})
+    status_file.write_text(json.dumps(existing, indent=2))
+
+
+def _issue_label(issue: str) -> str:
+    """Short human label for the issue source (max 60 chars)."""
+    if issue.startswith("https://github.com/"):
+        parts = issue.rstrip("/").split("/")
+        if len(parts) >= 5:
+            return f"{parts[3]}/{parts[4]}"
+    p = Path(issue)
+    # Use the filename/dirname for any absolute or relative path (even if non-existent)
+    if p.is_absolute() or "/" in issue:
+        name = p.name or issue
+        return name[:60]
+    if p.exists():
+        return p.name[:60]
+    return issue[:60]
 
 
 @click.group()
@@ -41,81 +218,454 @@ def main():
 # ──────────────────────────────────────────────────────────────────────────────
 
 @main.command()
-@click.option("--issue", required=True, help="Spec file path or GitHub issue URL")
+@click.option("--issue", required=True,
+              help="Spec file (SPEC.md, requirements doc), GitHub issue URL, or GitHub repo URL (brownfield)")
 @click.option(
     "--mode", default="standard", type=click.Choice(["quick", "standard", "thorough"]),
     show_default=True, help="Execution mode: quick=5 attacks, standard=20, thorough=50"
 )
 @click.option("--domain", default="owasp_top10", show_default=True,
-              help="Comma-separated policy domains (e.g. owasp_top10,soc2)")
+              help="Comma-separated policy domains (e.g. owasp_top10,hipaa,finra)")
+@click.option("--intent", default=None,
+              help="Business intent source: Jira key (PROJ-123), Confluence URL, or Aha! URL. "
+                   "Widens the attack surface beyond the spec alone. "
+                   "Requires JIRA_URL+JIRA_EMAIL+JIRA_TOKEN (or CONFLUENCE_* or AHA_* env vars).")
 @click.option("--pretty", is_flag=True, help="Human-readable Rich output instead of JSON")
 @click.option("--config", default=None, help="Path to .crucible.yml (default: auto-detect)")
-def run(issue: str, mode: str, domain: str, pretty: bool, config: str | None):
-    """Run a full CombatPair adversarial session on a spec or GitHub issue."""
-    asyncio.run(_run_async(issue, mode, domain, pretty, config))
+@click.option("--background", is_flag=True, default=False,
+              help="Fire-and-forget: run in a detached subprocess and return immediately.")
+@click.option("--run-id", default=None, hidden=True,
+              help="Pre-assigned run ID (used internally by --background launcher).")
+def run(issue: str, mode: str, domain: str, intent: str | None, pretty: bool,
+        config: str | None, background: bool, run_id: str | None):
+    """Run adversarial Builder + Breaker on a spec.
+
+    \b
+    Attack surface = spec (what to build) + intent (why it's needed).
+    Builder generates code from the spec. Breaker attacks it. Arbiter scores.
+    Spec drives the language: write "implement in Go" and Builder produces Go.
+
+    \b
+    Primary (greenfield — spec-driven):
+      crucible run --issue SPEC.md --pretty
+      crucible run --issue SPEC.md --intent PROJ-123 --domain hipaa
+      crucible run --issue SPEC.md --mode thorough --domain owasp_top10,finra
+      crucible run --issue https://github.com/owner/repo/issues/42
+
+    \b
+    Secondary (brownfield — extract spec from existing repo):
+      crucible run --issue https://github.com/pallets/flask --background
+      crucible run --issue /path/to/local/repo --mode quick
+    """
+    # ── Pre-flight: verify config before doing anything ───────────────────────
+    _cfg_preflight = CrucibleConfig.load(config)
+    _missing = _check_config_ready(_cfg_preflight)
+    if _missing:
+        console.print()
+        console.print("[red bold]⚔  CRUCIBLE cannot run — configuration is incomplete:[/red bold]")
+        console.print()
+        for problem, fix in _missing:
+            console.print(f"  [red]✗[/red]  {problem}")
+            console.print(f"     [dim]Fix: [bold cyan]{fix}[/bold cyan][/dim]")
+        console.print()
+        console.print("  [dim]Run [bold cyan]crucible setup[/bold cyan] for the full wizard.[/dim]")
+        console.print()
+        sys.exit(1)
+
+    if background:
+        from .output.report import generate_run_id as _gen_id
+        bg_run_id = run_id or _gen_id()
+        cfg = CrucibleConfig.load(config)
+        runs_dir = cfg.reports_dir.parent / "runs"
+        _write_run_status(bg_run_id, runs_dir,
+                          status="starting", issue=issue, mode=mode,
+                          started_at=datetime.now(timezone.utc).isoformat(), pid=None)
+
+        # Build subprocess args (same command minus --background).
+        # Use sys.executable + -c entry-point so the subprocess works regardless
+        # of whether `crucible` is on PATH (editable installs, virtualenvs, etc.)
+        entry = (
+            "from crucible.cli import main; main(standalone_mode=True)"
+        )
+        args = [sys.executable, "-c", entry, "run",
+                "--issue", issue, "--mode", mode, "--domain", domain]
+        if intent:
+            args += ["--intent", intent]
+        if config:
+            args += ["--config", config]
+        args += ["--run-id", bg_run_id]
+
+        log_path = runs_dir / f"{bg_run_id}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "w") as log_fh:
+            proc = subprocess.Popen(
+                args,
+                stdout=log_fh, stderr=log_fh,
+                start_new_session=True,  # detach from controlling terminal
+            )
+        _write_run_status(bg_run_id, runs_dir, status="running", pid=proc.pid)
+
+        console.print(f"\n[bold cyan]⚔  CRUCIBLE[/bold cyan]  run started in background")
+        console.print(f"   Run ID : [dim]{bg_run_id}[/dim]")
+        console.print(f"   Issue  : [dim]{_issue_label(issue)}[/dim]")
+        console.print(f"   Log    : [dim]{log_path}[/dim]")
+        console.print(f"   Check  : [bold]crucible status[/bold]")
+        console.print()
+        return
+
+    asyncio.run(_run_async(issue, mode, domain, intent, pretty, config, run_id))
 
 
-async def _run_async(issue: str, mode: str, domain: str, pretty: bool, config_path: str | None):
+async def _run_async(
+    issue: str,
+    mode: str,
+    domain: str,
+    intent_ref: str | None,
+    pretty: bool,
+    config_path: str | None,
+    preset_run_id: str | None = None,
+):
     cfg = CrucibleConfig.load(config_path)
+    runs_dir = cfg.reports_dir.parent / "runs"
 
     mode_attack_counts = {"quick": 5, "standard": 20, "thorough": 50}
     cfg.combat_pair.attack_count = mode_attack_counts[mode]
-
-    spec = _load_spec(issue)
-    if spec is None:
-        console.print(f"[red]Error:[/red] Cannot read spec from '{issue}'")
-        sys.exit(1)
-
-    domains = [d.strip() for d in domain.split(",")]
-    policy_context = _load_policy_context(cfg, domains)
-    recalled = _load_recalled_attacks(spec, cfg)
 
     from .core.combat_pair import CombatPair
     from .core.arbiter import Arbiter
     from .output.report import generate_run_id, build_report, save_report
 
-    run_id = generate_run_id()
+    run_id = preset_run_id or generate_run_id()
+    label = _issue_label(issue)
+    use_live = pretty and console.is_terminal
 
-    if pretty:
-        console.print(f"\n[bold]CRUCIBLE[/bold] run [dim]{run_id}[/dim]")
-        console.print(f"Mode: [cyan]{mode}[/cyan] · Attacks: {cfg.combat_pair.attack_count} · Domain: {domain}\n")
-
-    model_kwargs: dict = cfg.model_kwargs()
-
-    arbiter = Arbiter(**model_kwargs)
-    pair = CombatPair(config=cfg, recalled_attacks=recalled, policy_context=policy_context)
-
-    try:
-        result = await pair.run(spec, arbiter)
-    except Exception as e:
-        console.print(f"[red]Run failed:[/red] {e}")
-        sys.exit(1)
-
-    # Async score with LLM arbiter
-    for round_result in result.rounds:
-        await arbiter.score_round_async(round_result.build, round_result.breaker)
-    result.final_ars = arbiter.final_ars(result.all_attacks)
-
-    report = build_report(
-        result=result,
+    state = _RunProgress(
         run_id=run_id,
-        spec_ref=issue,
-        playbook_version=f"{domains[0]}@v2025.1",
+        issue_label=label,
+        mode=mode,
+        attack_total=cfg.combat_pair.attack_count,
     )
 
-    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
-    save_report(report, cfg.reports_dir)
-    Path(".last_report_id").write_text(run_id)
+    def _status(**kw):
+        _write_run_status(run_id, runs_dir, **kw)
+
+    def _plain(*msg: str):
+        """Fallback output when not using Rich Live (background subprocess or no-pretty)."""
+        if not use_live:
+            ts = datetime.now().strftime("%H:%M:%S")
+            for m in msg:
+                print(f"[{ts}] {m}", flush=True)
+
+    _status(status="running", issue=issue, mode=mode,
+            started_at=datetime.now(timezone.utc).isoformat())
+
+    # ── Phase 1: Load spec ────────────────────────────────────────────────────
+    state.phase = "loading"
+    _plain(f"[1/4] Loading spec from {label}...")
+
+    async def _do_load():
+        return await asyncio.get_event_loop().run_in_executor(None, _load_spec, issue)
+
+    if use_live:
+        with Live(_render_live_panel(state), console=console,
+                  refresh_per_second=4, transient=False) as live:
+            spec = await _do_load()
+            if spec is None:
+                state.phase = "error"
+                state.error = f"Cannot read spec from '{issue}'"
+                live.update(_render_live_panel(state))
+                _status(status="error", error=state.error)
+                sys.exit(1)
+
+            state.spec_bytes = len(spec.encode())
+            state.phase = "spec_done"
+            live.update(_render_live_panel(state))
+            _status(status="running", phase="spec_loaded", spec_bytes=state.spec_bytes)
+
+            # ── Phase 2: Intent + policy (fast, no separate phase display) ────
+            domains = [d.strip() for d in domain.split(",")]
+            policy_context = _load_policy_context(domains)
+            recalled = _load_recalled_attacks(spec)
+            intent_context, _ = await _resolve_intent(intent_ref, pretty=False)
+
+            # ── Phase 2: Combat ───────────────────────────────────────────────
+            state.phase = "combat"
+            state.combat_start = time.monotonic()
+            live.update(_render_live_panel(state))
+            _status(status="running", phase="combat")
+
+            arbiter = Arbiter(**cfg.model_kwargs())
+            pair = CombatPair(config=cfg, recalled_attacks=recalled,
+                              policy_context=policy_context, intent_context=intent_context)
+
+            try:
+                async with _live_ticker(live, lambda: _render_live_panel(state)):
+                    result = await pair.run(spec, arbiter)
+            except Exception as e:
+                error_msg = str(e) or f"{type(e).__name__}: (no message — check model config)"
+                state.phase = "error"
+                state.error = error_msg
+                live.update(_render_live_panel(state))
+                _status(status="error", error=error_msg)
+                console.print(f"\n[red bold]Error:[/red bold] {error_msg}")
+                console.print("[dim]  Run [bold cyan]crucible setup --model[/bold cyan] to change provider or refresh API key[/dim]")
+                sys.exit(1)
+
+            # ── Phase 3: Arbiter scoring (per-attack, with live updates) ──────
+            state.phase = "scoring"
+            state.attack_total = len(result.all_attacks)
+            live.update(_render_live_panel(state))
+            _status(status="running", phase="scoring", attack_total=state.attack_total)
+
+            all_attacks_flat = [
+                (rr.build.code, a) for rr in result.rounds for a in rr.breaker.attacks
+            ]
+            for build_code, attack in all_attacks_flat:
+                state.current_attack_cwe = attack.cwe
+                state.current_attack_title = attack.title
+                state.attack_start = time.monotonic()
+                live.update(_render_live_panel(state))
+                try:
+                    async with _live_ticker(live, lambda: _render_live_panel(state)):
+                        attack.score = await arbiter._score_attack(build_code, attack)
+                except Exception:
+                    attack.score = 0.5
+                verdict = ("MITIGATED" if attack.score == 1.0
+                           else "PARTIAL" if attack.score == 0.5 else "MISSED")
+                state.completed_attacks.append((attack.cwe, attack.title, verdict))
+                state.attacks_scored += 1
+                state.current_attack_cwe = ""
+                state.current_attack_title = ""
+                state.attack_start = 0.0
+                live.update(_render_live_panel(state))
+
+            result.final_ars = arbiter.final_ars(result.all_attacks)
+
+            # ── Phase 4: Save report ──────────────────────────────────────────
+            state.phase = "saving"
+            live.update(_render_live_panel(state))
+            report = build_report(result=result, run_id=run_id, spec_ref=issue,
+                                  intent_ref=intent_ref or "",
+                                  playbook_version=f"{domains[0]}@v2025.1")
+            cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+            save_report(report, cfg.reports_dir)
+            if not preset_run_id:
+                Path(".last_report_id").write_text(run_id)
+
+            state.phase = "done"
+            live.update(_render_live_panel(state))
+            _status(status="done", ars=result.final_ars,
+                    passed=result.final_ars >= cfg.gate.minimum_ars)
+
+    else:
+        # ── Non-TTY / background path: plain timestamped output ────────────
+        spec = _load_spec(issue)
+        if spec is None:
+            _plain(f"Error: Cannot read spec from '{issue}'")
+            _status(status="error", error=f"Cannot read spec from '{issue}'")
+            sys.exit(1)
+        state.spec_bytes = len(spec.encode())
+        _plain(f"[1/4] Spec loaded  ({state.spec_bytes} bytes)")
+        _status(status="running", phase="spec_loaded", spec_bytes=state.spec_bytes)
+
+        domains = [d.strip() for d in domain.split(",")]
+        policy_context = _load_policy_context(domains)
+        recalled = _load_recalled_attacks(spec)
+        intent_context, _ = await _resolve_intent(intent_ref, pretty=False)
+
+        _plain("[2/4] Builder + Breaker running concurrently...")
+        _status(status="running", phase="combat")
+        arbiter = Arbiter(**cfg.model_kwargs())
+        pair = CombatPair(config=cfg, recalled_attacks=recalled,
+                          policy_context=policy_context, intent_context=intent_context)
+        try:
+            result = await _await_with_heartbeat(pair.run(spec, arbiter), _plain)
+        except Exception as e:
+            error_msg = str(e) or f"{type(e).__name__}: (no message — check model config)"
+            _plain(f"Error: {error_msg}")
+            _plain("  Fix: crucible setup --model   (change provider or refresh API key)")
+            _status(status="error", error=error_msg)
+            sys.exit(1)
+
+        _plain(f"[3/4] Arbiter scoring {len(result.all_attacks)} attacks...")
+        _status(status="running", phase="scoring", attack_total=len(result.all_attacks))
+        all_attacks_flat = [
+            (rr.build.code, a) for rr in result.rounds for a in rr.breaker.attacks
+        ]
+        for i, (build_code, attack) in enumerate(all_attacks_flat, 1):
+            _plain(f"      scoring {i}/{len(all_attacks_flat)}: {attack.cwe} {attack.title}")
+            try:
+                attack.score = await _await_with_heartbeat(
+                    arbiter._score_attack(build_code, attack), _plain, interval=15.0
+                )
+            except Exception:
+                attack.score = 0.5
+            verdict = ("MITIGATED" if attack.score == 1.0
+                       else "PARTIAL" if attack.score == 0.5 else "MISSED")
+            _plain(f"      → {verdict}")
+        result.final_ars = arbiter.final_ars(result.all_attacks)
+
+        _plain("[4/4] Saving report...")
+        _status(status="running", phase="saving")
+        report = build_report(result=result, run_id=run_id, spec_ref=issue,
+                               intent_ref=intent_ref or "",
+                               playbook_version=f"{domains[0]}@v2025.1")
+        cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+        save_report(report, cfg.reports_dir)
+        if not preset_run_id:
+            Path(".last_report_id").write_text(run_id)
+        _status(status="done", ars=result.final_ars,
+                passed=result.final_ars >= cfg.gate.minimum_ars)
+        _plain(f"Done. ARS={result.final_ars:.3f}  run_id={run_id}")
 
     passed = result.final_ars >= cfg.gate.minimum_ars
 
-    if pretty:
-        _print_run_summary(report, passed, cfg)
-    else:
+    if pretty and use_live:
+        _print_run_summary(report, passed)
+    elif not use_live and not preset_run_id:
         click.echo(json.dumps({"run_id": run_id, "ars": result.final_ars, "passed": passed}))
 
     if not passed and not cfg.gate.fail_open:
         sys.exit(1)
+
+
+async def _resolve_intent(intent_ref: str | None, pretty: bool) -> tuple[str, str]:
+    """Resolve business intent from Jira/Confluence/Aha! or return empty strings."""
+    if not intent_ref:
+        return "", ""
+    from .brain.intent_adapter import IntentAdapter, format_intent_context
+    adapter = IntentAdapter()
+    result = adapter.resolve(intent_ref)
+    if result.resolved:
+        if pretty:
+            console.print(f"[green]✓[/green]  Intent resolved from [bold]{result.source}[/bold]: "
+                          f"{result.source_url or intent_ref}")
+        return format_intent_context(result), result.source
+    if pretty:
+        console.print(f"[yellow]⚠[/yellow]  Intent not resolved ({result.error}) — using spec only")
+    return "", ""
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# crucible status
+# ──────────────────────────────────────────────────────────────────────────────
+
+@main.command("status")
+@click.option("--all", "show_all", is_flag=True, default=False,
+              help="Show all completed runs, not just recent 10.")
+def status_cmd(show_all: bool):
+    """Show running and recently completed adversarial runs."""
+    import os as _os
+    cfg = CrucibleConfig.load()
+    runs_dir = cfg.reports_dir.parent / "runs"
+    reports_dir = cfg.reports_dir
+
+    rows: list[dict] = []
+
+    # ── In-progress / background runs ────────────────────────────────────────
+    if runs_dir.exists():
+        for sf in sorted(runs_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                data = json.loads(sf.read_text())
+            except Exception:
+                continue
+            if data.get("status") in ("running", "starting"):
+                pid = data.get("pid")
+                alive = False
+                if pid:
+                    try:
+                        _os.kill(int(pid), 0)
+                        alive = True
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                if alive:
+                    elapsed = ""
+                    started = data.get("started_at", "")
+                    if started:
+                        try:
+                            from datetime import datetime, timezone
+                            dt = datetime.fromisoformat(started)
+                            elapsed = _fmt_elapsed((datetime.now(timezone.utc) - dt).total_seconds())
+                        except Exception:
+                            pass
+                    rows.append({
+                        "run_id": data.get("run_id", sf.stem),
+                        "status": "RUNNING",
+                        "issue": _issue_label(data.get("issue", "")),
+                        "mode": data.get("mode", ""),
+                        "ars": "—",
+                        "gate": "—",
+                        "elapsed": elapsed,
+                    })
+                else:
+                    # PID dead but status still "running" — mark stale
+                    sf.unlink(missing_ok=True)
+
+    # ── Completed runs ────────────────────────────────────────────────────────
+    completed: list[dict] = []
+    if reports_dir.exists():
+        for rf in sorted(reports_dir.glob("*.json"),
+                         key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                r = json.loads(rf.read_text())
+                completed.append(r)
+            except Exception:
+                continue
+
+    limit = None if show_all else 10
+    for r in (completed if limit is None else completed[:limit]):
+        ars = r.get("ars_score", 0.0)
+        passed = ars >= cfg.gate.minimum_ars
+        ts = r.get("generated_at", "")[:16].replace("T", " ")
+        rows.append({
+            "run_id": r.get("run_id", ""),
+            "status": "PASS" if passed else "BLOCKED",
+            "issue": _issue_label(r.get("spec_ref", "")),
+            "mode": "—",
+            "ars": f"{ars:.3f}",
+            "gate": "✓" if passed else "✗",
+            "elapsed": ts,
+        })
+
+    if not rows:
+        console.print("[dim]No runs found. Start one with:[/dim] [bold]crucible run --issue <url> --pretty[/bold]")
+        return
+
+    tbl = Table(show_header=True, header_style="bold cyan", border_style="blue",
+                show_lines=False, pad_edge=True)
+    tbl.add_column("Run ID", style="dim", no_wrap=True, max_width=32)
+    tbl.add_column("Status", no_wrap=True)
+    tbl.add_column("Issue / Repo", max_width=30)
+    tbl.add_column("Mode")
+    tbl.add_column("ARS", justify="right")
+    tbl.add_column("Gate", justify="center")
+    tbl.add_column("Started / Elapsed")
+
+    status_styles = {
+        "RUNNING": "bold yellow",
+        "PASS": "bold green",
+        "BLOCKED": "bold red",
+    }
+
+    for r in rows:
+        st = r["status"]
+        style = status_styles.get(st, "")
+        tbl.add_row(
+            r["run_id"][-28:],
+            f"[{style}]{st}[/{style}]",
+            r["issue"],
+            r["mode"],
+            r["ars"],
+            r["gate"],
+            r["elapsed"],
+        )
+
+    console.print()
+    console.print(tbl)
+    running = sum(1 for r in rows if r["status"] == "RUNNING")
+    if running:
+        console.print(f"\n[dim]{running} run(s) active — refresh with [bold]crucible status[/bold][/dim]")
+    console.print()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -241,6 +791,543 @@ def doctor(network_check: bool, pretty: bool):
         click.echo(json.dumps({"passed": all_pass}))
 
     sys.exit(0 if all_pass else 1)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# crucible setup  — interactive first-run wizard
+# ──────────────────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.option("--model", "section_model", is_flag=True, default=False,
+              help="Update model provider and API key only (re-run at any time).")
+@click.option("--tokens", "section_tokens", is_flag=True, default=False,
+              help="Update integration tokens only (Jira, GitHub, Confluence, Aha!).")
+def setup(section_model: bool, section_tokens: bool):
+    """Configure CRUCIBLE — run at any time to change model or refresh tokens.
+
+    \b
+    crucible setup              ← full wizard (first run or complete reconfigure)
+    crucible setup --model      ← change AI provider or API key only
+    crucible setup --tokens     ← refresh Jira / GitHub / Confluence tokens only
+
+    \b
+    All credentials are written to .env — no file editing needed.
+    API keys expire; re-run whenever a token stops working.
+    """
+    _run_setup_wizard(section_model=section_model, section_tokens=section_tokens)
+
+
+def _run_setup_wizard(section_model: bool = False, section_tokens: bool = False) -> None:  # noqa: C901
+    import os
+    import httpx
+
+    env_path = Path(".env")
+    existing_env: dict[str, str] = {}
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                existing_env[k.strip()] = v.strip()
+
+    console.print()
+    console.print("[bold blue]⚔  CRUCIBLE Setup Wizard[/bold blue]")
+    if section_model:
+        console.print("[dim]Updating model provider and API key — all other settings preserved.[/dim]")
+    elif section_tokens:
+        console.print("[dim]Updating integration tokens — model settings preserved.[/dim]")
+    else:
+        console.print("[dim]Everything stays in this terminal. We write your .env automatically — no file editing needed.[/dim]")
+    console.print()
+
+    run_all = not section_model and not section_tokens
+    new_env: dict[str, str] = dict(existing_env)
+
+    # ── Steps 1+2: Model provider + credentials ──────────────────────────────
+    # When --tokens is passed, skip model selection entirely and preserve .env values.
+    if run_all or section_model:
+        console.print("[bold]Step 1 of 4 — Choose your AI model provider[/bold]")
+        console.print()
+        console.print("  [bold cyan]1. Anthropic Claude[/bold cyan]")
+        console.print("     Best quality for security analysis. Paid — get key at console.anthropic.com/keys")
+        console.print("     Models: claude-fable-5, claude-opus-4.8, claude-sonnet-4-6, claude-haiku-4-5")
+        console.print()
+        console.print("  [bold cyan]2. OpenRouter[/bold cyan]  [green](free tier available)[/green]")
+        console.print("     300+ models including free Llama, DeepSeek, Qwen. Get key at openrouter.ai/keys")
+        console.print("     Free models available — no credit card required to start.")
+        console.print()
+        console.print("  [bold cyan]3. OpenAI[/bold cyan]")
+        console.print("     GPT-4o, o1, o3-mini and more. Paid — get key at platform.openai.com/api-keys")
+        console.print()
+        console.print("  [bold cyan]4. HuggingFace[/bold cyan]  [green](free serverless inference)[/green]")
+        console.print("     Llama 3.1, Mistral, Qwen and more. Free — get token at huggingface.co/settings/tokens")
+        console.print()
+        console.print("  [bold cyan]5. Ollama (local / air-gapped)[/bold cyan]")
+        console.print("     Runs 100% on your machine. No API key. Requires Ollama: ollama.com/download")
+        console.print()
+
+        choice = click.prompt(
+            "  Enter choice",
+            type=click.Choice(["1", "2", "3", "4", "5"]),
+            show_choices=False,
+        )
+    else:
+        # --tokens only: skip model steps; all if/elif on choice below become no-ops
+        choice = ""
+        console.print("[dim]Model settings preserved. Run [bold cyan]crucible setup --model[/bold cyan] to change provider.[/dim]")
+        console.print()
+    provider_names = {"1": "Anthropic Claude", "2": "OpenRouter", "3": "OpenAI",
+                      "4": "HuggingFace", "5": "Ollama (local)"}
+    provider_name = provider_names.get(choice, "")
+    console.print()
+
+    # ── Step 2: Credentials + model selection ─────────────────────────────────
+    console.print(f"[bold]Step 2 of 4 — {provider_name} credentials & model[/bold]")
+    console.print()
+
+    def _validate_key_metadata(url: str, headers: dict, label: str) -> bool:
+        """Validate API key using a lightweight metadata endpoint — no model calls, no 429 risk."""
+        console.print(f"  [dim]Verifying key with {label}...[/dim]", end="")
+        try:
+            r = httpx.get(url, headers=headers, timeout=10)
+            if r.status_code in (200, 401, 403):
+                ok = r.status_code == 200
+                console.print(f" [{'green' if ok else 'red'}]{'✓ Valid' if ok else '✗ Invalid key'}[/{'green' if ok else 'red'}]")
+                return ok
+            # 404 etc — server reachable, key likely fine
+            console.print(f" [yellow]? Server responded {r.status_code} — assuming valid[/yellow]")
+            return True
+        except Exception as e:
+            console.print(f" [red]✗ Network error: {e}[/red]")
+            return False
+
+    if choice == "1":  # Anthropic
+        key = click.prompt("  Anthropic API key (sk-ant-...)", hide_input=True)
+        new_env["ANTHROPIC_API_KEY"] = key
+
+        valid = _validate_key_metadata(
+            "https://api.anthropic.com/v1/models",
+            {"x-api-key": key, "anthropic-version": "2023-06-01"},
+            "Anthropic",
+        )
+        if not valid and not click.confirm("  Continue anyway?", default=True):
+            console.print("[yellow]Setup cancelled.[/yellow]"); return
+
+        console.print()
+        console.print("  Available Claude models:")
+        models_a = [
+            ("1",  "claude-fable-5",           "Latest flagship — best reasoning & security analysis"),
+            ("2",  "claude-opus-4-8",           "Opus 4.8 — most capable, highest cost"),
+            ("3",  "claude-sonnet-4-6",         "Sonnet 4.6 — balanced quality/speed (recommended)"),
+            ("4",  "claude-haiku-4-5-20251001", "Haiku — fastest, lowest cost, great for CI"),
+            ("5",  "claude-3-5-sonnet-20241022","Claude 3.5 Sonnet — stable, widely used"),
+            ("6",  "claude-3-haiku-20240307",   "Claude 3 Haiku — ultra-fast, very low cost"),
+        ]
+        for n, m, d in models_a:
+            console.print(f"    {n}. [bold]{m}[/bold] — {d}")
+        mc = click.prompt("  Select model", type=click.Choice([r[0] for r in models_a]),
+                          default="3", show_choices=False)
+        new_env["ANTHROPIC_MODEL"] = models_a[int(mc) - 1][1]
+
+    elif choice == "2":  # OpenRouter
+        key = click.prompt("  OpenRouter API key (sk-or-...)", hide_input=True)
+        new_env["OPENROUTER_API_KEY"] = key
+
+        # Validate key AND fetch live model catalog simultaneously
+        console.print("  [dim]Verifying key & fetching live model catalog...[/dim]", end="")
+        or_models: list[dict] = []
+        try:
+            r = httpx.get(
+                "https://openrouter.ai/api/v1/models",
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=15,
+            )
+            r.raise_for_status()
+            or_models = r.json().get("data", [])
+            console.print(f" [green]✓ Valid — {len(or_models)} models available[/green]")
+        except Exception as e:
+            console.print(f" [red]✗ {e}[/red]")
+            if not click.confirm("  Continue anyway?", default=True):
+                console.print("[yellow]Setup cancelled.[/yellow]"); return
+
+        console.print()
+
+        # Separate free and paid
+        free_models = [m for m in or_models if m.get("pricing", {}).get("prompt") == "0"
+                       and m.get("pricing", {}).get("completion") == "0"]
+        # Group paid by family prefix
+        def _family(mid: str) -> str:
+            prefix = mid.split("/")[0] if "/" in mid else "other"
+            return {"anthropic": "Anthropic Claude", "openai": "OpenAI GPT",
+                    "meta-llama": "Meta Llama", "google": "Google Gemini",
+                    "deepseek": "DeepSeek", "qwen": "Qwen/Alibaba",
+                    "mistralai": "Mistral", "cohere": "Cohere",
+                    "nvidia": "NVIDIA", "x-ai": "xAI Grok"}.get(prefix, prefix.capitalize())
+
+        console.print(f"  [bold green]FREE TIER ({len(free_models)} models — no cost, no credit card):[/bold green]")
+        free_idx: list[str] = []
+        for i, m in enumerate(free_models, 1):
+            ctx = m.get("context_length", 0)
+            ctx_str = f"{ctx//1000}K ctx" if ctx else ""
+            console.print(f"    [bold]{i:>2}.[/bold] [green]{m['id']}[/green]  [dim]{ctx_str}[/dim]")
+            free_idx.append(m["id"])
+
+        console.print()
+
+        # Group paid models by family
+        paid = [m for m in or_models if m not in free_models]
+        families: dict[str, list[dict]] = {}
+        for m in paid:
+            fam = _family(m["id"])
+            families.setdefault(fam, []).append(m)
+
+        # Show top families with representative models
+        priority_families = ["Anthropic Claude", "OpenAI GPT", "Meta Llama", "Google Gemini",
+                             "DeepSeek", "Qwen/Alibaba", "Mistral", "xAI Grok"]
+        console.print("  [bold]PAID MODELS by family (representative selection):[/bold]")
+        paid_display: list[str] = []
+        idx = len(free_models) + 1
+        for fam in priority_families:
+            if fam not in families:
+                continue
+            fam_models = sorted(families[fam], key=lambda x: x.get("created", 0), reverse=True)[:4]
+            console.print(f"  [bold cyan]  {fam}:[/bold cyan]")
+            for m in fam_models:
+                ctx = m.get("context_length", 0)
+                prompt_price = m.get("pricing", {}).get("prompt", "?")
+                try:
+                    price_str = f"${float(prompt_price)*1e6:.2f}/M tok"
+                except (ValueError, TypeError):
+                    price_str = ""
+                console.print(f"    [bold]{idx:>2}.[/bold] {m['id']}  [dim]{price_str}[/dim]")
+                paid_display.append(m["id"])
+                idx += 1
+
+        all_displayed = free_idx + paid_display
+        console.print()
+        console.print("  [dim]Enter a number from the list, or type any full model ID (e.g. anthropic/claude-opus-4.8)[/dim]")
+        raw = click.prompt("  Select model", default="1")
+
+        if raw.isdigit() and 1 <= int(raw) <= len(all_displayed):
+            chosen_model = all_displayed[int(raw) - 1]
+        else:
+            chosen_model = raw.strip()
+        new_env["OPENROUTER_MODEL"] = chosen_model
+        console.print(f"  [green]✓ Using: {chosen_model}[/green]")
+
+    elif choice == "3":  # OpenAI
+        key = click.prompt("  OpenAI API key (sk-...)", hide_input=True)
+        new_env["OPENAI_COMPAT_API_KEY"] = key
+        new_env["OPENAI_COMPAT_BASE_URL"] = "https://api.openai.com/v1"
+
+        valid = _validate_key_metadata(
+            "https://api.openai.com/v1/models",
+            {"Authorization": f"Bearer {key}"},
+            "OpenAI",
+        )
+        if not valid and not click.confirm("  Continue anyway?", default=True):
+            console.print("[yellow]Setup cancelled.[/yellow]"); return
+
+        console.print()
+        console.print("  Available OpenAI models:")
+        models_oai = [
+            ("1",  "gpt-4o-mini",     "Fast, low cost — great for CI"),
+            ("2",  "gpt-4o",          "Best GPT-4 quality"),
+            ("3",  "o3-mini",         "OpenAI o3 mini — strong reasoning, lower cost"),
+            ("4",  "o1",              "o1 — deep reasoning, higher cost"),
+            ("5",  "o1-mini",         "o1 mini — reasoning at lower cost"),
+            ("6",  "gpt-4-turbo",     "GPT-4 Turbo — large context"),
+            ("7",  "gpt-3.5-turbo",   "GPT-3.5 — cheapest option"),
+        ]
+        for n, m, d in models_oai:
+            console.print(f"    {n}. [bold]{m}[/bold] — {d}")
+        mc = click.prompt("  Select model", type=click.Choice([r[0] for r in models_oai]),
+                          default="1", show_choices=False)
+        new_env["OPENAI_COMPAT_MODEL"] = models_oai[int(mc) - 1][1]
+
+    elif choice == "4":  # HuggingFace
+        token = click.prompt("  HuggingFace token (hf_...)", hide_input=True)
+        new_env["HF_TOKEN"] = token
+
+        valid = _validate_key_metadata(
+            "https://huggingface.co/api/whoami-v2",
+            {"Authorization": f"Bearer {token}"},
+            "HuggingFace",
+        )
+        if not valid and not click.confirm("  Continue anyway?", default=True):
+            console.print("[yellow]Setup cancelled.[/yellow]"); return
+
+        console.print()
+        console.print("  Available HuggingFace models (free serverless inference):")
+        models_hf = [
+            ("1",  "meta-llama/Llama-3.1-70B-Instruct",   "Llama 3.1 70B — best open-source quality"),
+            ("2",  "meta-llama/Llama-3.1-8B-Instruct",    "Llama 3.1 8B — fast, lighter"),
+            ("3",  "meta-llama/Llama-3.2-90B-Vision-Instruct", "Llama 3.2 90B — largest Llama"),
+            ("4",  "Qwen/Qwen2.5-72B-Instruct",           "Qwen 2.5 72B — strong coder"),
+            ("5",  "Qwen/QwQ-32B",                        "QwQ 32B — reasoning model"),
+            ("6",  "mistralai/Mistral-7B-Instruct-v0.3",  "Mistral 7B — efficient"),
+            ("7",  "mistralai/Mixtral-8x7B-Instruct-v0.1","Mixtral 8x7B — mixture of experts"),
+            ("8",  "deepseek-ai/DeepSeek-R1-Distill-Llama-70B", "DeepSeek R1 — reasoning"),
+            ("9",  "google/gemma-2-27b-it",               "Gemma 2 27B — Google open model"),
+            ("10", "microsoft/Phi-4",                     "Phi-4 — Microsoft, excellent per-size"),
+        ]
+        for n, m, d in models_hf:
+            console.print(f"    {n:>2}. [bold]{m.split('/')[-1]}[/bold] — {d}")
+            console.print(f"          [dim]{m}[/dim]")
+        mc = click.prompt("  Select model", type=click.Choice([r[0] for r in models_hf]),
+                          default="1", show_choices=False)
+        new_env["HF_MODEL"] = models_hf[int(mc) - 1][1]
+
+    else:  # Ollama
+        console.print("  Ollama runs 100% on your machine — no API key, no data leaves your network.")
+        console.print()
+        ollama_url = click.prompt("  Ollama server URL", default="http://localhost:11434")
+
+        console.print()
+        console.print("  [dim]Checking Ollama server...[/dim]", end="")
+        available: list[str] = []
+        try:
+            r = httpx.get(f"{ollama_url}/api/tags", timeout=5)
+            r.raise_for_status()
+            available = [m["name"] for m in r.json().get("models", [])]
+            console.print(f" [green]✓ Running — {len(available)} model(s) installed[/green]")
+        except Exception:
+            console.print(" [red]✗ Not reachable[/red]")
+            console.print("  → Start Ollama: [bold]ollama serve[/bold]")
+            console.print("  → Install:      [bold]https://ollama.com/download[/bold]")
+            if not click.confirm("  Continue anyway?", default=True):
+                console.print("[yellow]Setup cancelled.[/yellow]"); return
+
+        console.print()
+        if available:
+            console.print("  [bold]Installed models:[/bold]")
+            for i, m in enumerate(available, 1):
+                console.print(f"    {i:>2}. [bold]{m}[/bold]")
+            console.print()
+
+        console.print("  [bold]Recommended models for security analysis[/bold] (pull with [cyan]ollama pull <name>[/cyan]):")
+        recommended = [
+            ("llama3.1:8b",   "~4.7 GB", "Best quality/size — recommended"),
+            ("llama3.2:3b",   "~2 GB",   "Fast, good for CI pipelines"),
+            ("llama3.3:70b",  "~43 GB",  "Highest quality Llama (needs 64+ GB RAM)"),
+            ("mistral:7b",    "~4.1 GB", "Strong reasoning"),
+            ("deepseek-r1:7b","~4.7 GB", "Reasoning model"),
+            ("qwen2.5-coder:7b","~4.7 GB","Best for code analysis"),
+            ("phi4:14b",      "~8.9 GB", "Microsoft Phi-4, excellent per-size"),
+        ]
+        for name, size, desc in recommended:
+            installed_mark = " [green]✓ installed[/green]" if any(name in a for a in available) else ""
+            console.print(f"    [bold]{name}[/bold]  [dim]{size}[/dim]  {desc}{installed_mark}")
+
+        console.print()
+        default_model = available[0] if available else "llama3.1:8b"
+        raw = click.prompt("  Model name (or number from installed list)", default=default_model)
+        if raw.isdigit() and 1 <= int(raw) <= len(available):
+            raw = available[int(raw) - 1]
+        new_env["OLLAMA_MODEL"] = raw
+        new_env["OLLAMA_ENDPOINT"] = ollama_url
+        console.print(f"  [green]✓ Using: {raw}[/green]")
+
+    if run_all or section_model:
+        # Record the user's explicit choice so it always wins over guessing the
+        # provider from whichever API key happens to be sitting in .env — no ad-hoc
+        # model decisions, ever. See CrucibleConfig.load() in config.py.
+        new_env["MODEL_PROVIDER"] = {
+            "1": "anthropic", "2": "openrouter", "3": "openai_compat",
+            "4": "huggingface", "5": "local",
+        }[choice]
+
+    # ── Step 3: Business intent integrations ──────────────────────────────────
+    # When --model is passed, skip integrations entirely and preserve existing tokens.
+    _do_step3 = run_all or section_tokens
+
+    if not _do_step3:
+        console.print("[dim]Integration tokens preserved. Run [bold cyan]crucible setup --tokens[/bold cyan] to update.[/dim]")
+        console.print()
+
+    if _do_step3:
+        console.print()
+        console.print("[bold]Step 3 of 4 — Business intent integrations[/bold]")
+        console.print("[dim]CRUCIBLE's attack surface = spec (what to build) + intent (why it's needed).[/dim]")
+        console.print("[dim]Connect your issue tracker so CRUCIBLE automatically widens its attack surface[/dim]")
+        console.print("[dim]using the business context from your tickets.[/dim]")
+        console.print()
+        console.print("  [dim]Usage after setup:  crucible run --issue SPEC.md --intent PROJ-123[/dim]")
+        console.print()
+
+    # GitHub
+    gh_token = new_env.get("GITHUB_TOKEN", "") if _do_step3 else None
+    if _do_step3 and gh_token:
+        console.print(f"  [green]✓ GitHub already configured[/green] [dim](...{gh_token[-4:]})[/dim]")
+    elif _do_step3:
+        console.print("  ┌─ [bold]GitHub[/bold] ─────────────────────────────────────────────────────────")
+        console.print("  │  Read private repos and GitHub issue URLs as specs.")
+        console.print("  │  Get token → github.com/settings/tokens  (scope: public_repo)")
+        console.print("  └─────────────────────────────────────────────────────────────────")
+        gh = click.prompt("  GitHub token (ghp_...) or Enter to skip", default="", hide_input=True)
+        if gh:
+            new_env["GITHUB_TOKEN"] = gh
+            console.print("  [green]✓ GitHub token saved[/green]")
+        else:
+            console.print("  [dim]Skipped — GitHub issue URLs will be read without auth (public only)[/dim]")
+    if _do_step3:
+        console.print()
+
+    # Jira
+    if _do_step3 and new_env.get("JIRA_URL") and new_env.get("JIRA_EMAIL") and new_env.get("JIRA_TOKEN"):
+        console.print(f"  [green]✓ Jira already configured[/green] [dim]({new_env['JIRA_URL']})[/dim]")
+    elif _do_step3:
+        console.print("  ┌─ [bold]Jira[/bold] ────────────────────────────────────────────────────────────")
+        console.print("  │  Pull business requirements from Jira stories into the attack surface.")
+        console.print("  │  Usage: crucible run --issue SPEC.md --intent PROJ-123")
+        console.print("  │  Get API token → id.atlassian.com/manage-profile/security/api-tokens")
+        console.print("  └─────────────────────────────────────────────────────────────────")
+        if click.confirm("  Connect Jira?", default=True):
+            jira_url = click.prompt("  Jira base URL (e.g. https://yourorg.atlassian.net)")
+            # Strip trailing UI paths — keep only the base
+            jira_url = jira_url.split("/jira/")[0].split("/rest/")[0].rstrip("/")
+            new_env["JIRA_URL"] = jira_url
+            new_env["JIRA_EMAIL"] = click.prompt("  Jira account email")
+            new_env["JIRA_TOKEN"] = click.prompt(
+                "  Jira API token (from id.atlassian.com/manage-profile/security/api-tokens)",
+                hide_input=True,
+            )
+            # Validate the connection immediately
+            try:
+                import base64, httpx as _httpx
+                _creds = base64.b64encode(
+                    f"{new_env['JIRA_EMAIL']}:{new_env['JIRA_TOKEN']}".encode()
+                ).decode()
+                _r = _httpx.get(
+                    f"{new_env['JIRA_URL']}/rest/api/3/myself",
+                    headers={"Authorization": f"Basic {_creds}", "Accept": "application/json"},
+                    timeout=8,
+                )
+                if _r.status_code == 200:
+                    _name = _r.json().get("displayName", "")
+                    console.print(f"  [green]✓ Jira connected[/green] [dim](authenticated as {_name})[/dim]")
+                else:
+                    console.print(f"  [yellow]⚠ Jira returned {_r.status_code} — check URL/email/token[/yellow]")
+            except Exception as _e:
+                console.print(f"  [yellow]⚠ Could not validate Jira connection: {_e}[/yellow]")
+                console.print("  [dim]Credentials saved — verify manually with: crucible run --intent PROJ-1[/dim]")
+        else:
+            console.print("  [dim]Skipped — use --intent PROJ-123 after adding JIRA_URL/JIRA_EMAIL/JIRA_TOKEN to .env[/dim]")
+    if _do_step3:
+        console.print()
+
+    # Confluence
+    if _do_step3 and new_env.get("CONFLUENCE_URL") and new_env.get("CONFLUENCE_EMAIL") and new_env.get("CONFLUENCE_TOKEN"):
+        console.print(f"  [green]✓ Confluence already configured[/green] [dim]({new_env['CONFLUENCE_URL']})[/dim]")
+    elif _do_step3:
+        console.print("  ┌─ [bold]Confluence[/bold] ──────────────────────────────────────────────────────")
+        console.print("  │  Pull business context from Confluence pages into the attack surface.")
+        console.print("  │  Usage: crucible run --issue SPEC.md --intent https://yourorg.atlassian.net/wiki/spaces/...")
+        console.print("  │  Uses the same API token as Jira (id.atlassian.com/manage-profile/security/api-tokens)")
+        console.print("  └─────────────────────────────────────────────────────────────────")
+        if click.confirm("  Connect Confluence?", default=False):
+            conf_url = click.prompt(
+                "  Confluence base URL (e.g. https://yourorg.atlassian.net)",
+                default=new_env.get("JIRA_URL", ""),
+            )
+            conf_url = conf_url.split("/jira/")[0].split("/wiki/")[0].rstrip("/")
+            new_env["CONFLUENCE_URL"] = conf_url
+            new_env["CONFLUENCE_EMAIL"] = click.prompt(
+                "  Confluence account email",
+                default=new_env.get("JIRA_EMAIL", ""),
+            )
+            new_env["CONFLUENCE_TOKEN"] = click.prompt(
+                "  Confluence API token",
+                default=new_env.get("JIRA_TOKEN", ""),
+                hide_input=True,
+            )
+            # Validate
+            try:
+                import base64, httpx as _httpx
+                _creds = base64.b64encode(
+                    f"{new_env['CONFLUENCE_EMAIL']}:{new_env['CONFLUENCE_TOKEN']}".encode()
+                ).decode()
+                _r = _httpx.get(
+                    f"{new_env['CONFLUENCE_URL']}/wiki/rest/api/user/current",
+                    headers={"Authorization": f"Basic {_creds}", "Accept": "application/json"},
+                    timeout=8,
+                )
+                if _r.status_code == 200:
+                    _name = _r.json().get("displayName", "")
+                    console.print(f"  [green]✓ Confluence connected[/green] [dim](authenticated as {_name})[/dim]")
+                else:
+                    console.print(f"  [yellow]⚠ Confluence returned {_r.status_code} — check credentials[/yellow]")
+            except Exception as _e:
+                console.print(f"  [yellow]⚠ Could not validate Confluence: {_e}[/yellow]")
+        else:
+            console.print("  [dim]Skipped[/dim]")
+    if _do_step3:
+        console.print()
+
+    # Aha!
+    if _do_step3 and not new_env.get("AHA_DOMAIN"):
+        console.print("  ┌─ [bold]Aha![/bold] ────────────────────────────────────────────────────────────")
+        console.print("  │  Pull feature intent from Aha! roadmap items.")
+        console.print("  │  Usage: crucible run --issue SPEC.md --intent https://yourco.aha.io/features/FEAT-1")
+        console.print("  └─────────────────────────────────────────────────────────────────")
+        if click.confirm("  Connect Aha!?", default=False):
+            new_env["AHA_DOMAIN"] = click.prompt("  Aha! domain (e.g. yourco.aha.io)")
+            new_env["AHA_TOKEN"] = click.prompt("  Aha! API token", hide_input=True)
+            console.print("  [green]✓ Aha! configured[/green]")
+        else:
+            console.print("  [dim]Skipped[/dim]")
+    elif _do_step3:
+        console.print(f"  [green]✓ Aha! already configured[/green] [dim]({new_env['AHA_DOMAIN']})[/dim]")
+
+    # ── Step 4: Write .env ────────────────────────────────────────────────────
+    console.print()
+    console.print("[bold]Step 4 of 4 — Saving configuration[/bold]")
+    console.print()
+
+    key_order = [
+        ("# Model provider",
+         ["MODEL_PROVIDER",
+          "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
+          "OPENROUTER_API_KEY", "OPENROUTER_MODEL",
+          "OPENAI_COMPAT_API_KEY", "OPENAI_COMPAT_BASE_URL", "OPENAI_COMPAT_MODEL",
+          "HF_TOKEN", "HF_MODEL",
+          "OLLAMA_MODEL", "OLLAMA_ENDPOINT"]),
+        ("# GitHub", ["GITHUB_TOKEN"]),
+        ("# Jira", ["JIRA_URL", "JIRA_EMAIL", "JIRA_TOKEN"]),
+        ("# Confluence", ["CONFLUENCE_URL", "CONFLUENCE_EMAIL", "CONFLUENCE_TOKEN"]),
+        ("# Aha!", ["AHA_DOMAIN", "AHA_TOKEN"]),
+    ]
+    lines = [
+        "# CRUCIBLE — written by `crucible setup`",
+        "# Re-run `crucible setup` to change provider or add integrations.",
+        "",
+    ]
+    for comment, keys in key_order:
+        section = {k: new_env[k] for k in keys if k in new_env}
+        if section:
+            lines.append(comment)
+            for k, v in section.items():
+                lines.append(f"{k}={v}")
+            lines.append("")
+
+    env_path.write_text("\n".join(lines))
+    for k, v in new_env.items():
+        os.environ[k] = v
+
+    console.print(f"  [green]✓ Saved to {env_path.resolve()}[/green]")
+    console.print()
+
+    cfg = CrucibleConfig.load()
+    console.print(f"  [green]✓ Active provider: {cfg.effective_model_provider}[/green]")
+    console.print()
+    console.print("[bold green]✓ Setup complete![/bold green]")
+    console.print()
+    console.print("  [bold]Next steps:[/bold]")
+    console.print("    [bold cyan]crucible run --issue examples/demo_issue.md --pretty[/bold cyan]   ← first adversarial session")
+    console.print("    [bold cyan]crucible integrate[/bold cyan]                                       ← wire into your IDE")
+    console.print("    [bold cyan]crucible dashboard[/bold cyan]                                       ← open the web UI")
+    console.print()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -733,12 +1820,13 @@ def prune(older_than: str, dry_run: bool):
 @click.option("--host", default="127.0.0.1", show_default=True, help="Host to bind")
 @click.option("--reload", is_flag=True, help="Enable auto-reload (development only)")
 def dashboard(port: int, host: str, reload: bool):
-    """Launch the Combat Dashboard web UI (requires pip install crucible-ai[ui])."""
+    """Launch the Combat Dashboard web UI."""
     try:
         import uvicorn  # noqa: F401
-    except ImportError:
-        console.print("[red]Error:[/red] Combat Dashboard requires FastAPI and Uvicorn.")
-        console.print("Install with: [bold]pip install crucible-ai[ui][/bold]")
+        import fastapi  # noqa: F401
+    except ImportError as exc:
+        console.print(f"[red]Error:[/red] Combat Dashboard requires FastAPI and Uvicorn ({exc}).")
+        console.print("Fix with: [bold]pip install fastapi uvicorn[/bold]")
         sys.exit(1)
 
     console.print(f"\n[bold]CRUCIBLE Combat Dashboard[/bold]")
@@ -919,29 +2007,424 @@ def mcp_server(config_path: str | None):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# crucible findings  — vulnerability-first view of last (or specified) run
+# ──────────────────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.argument("run_id", required=False, default=None)
+@click.option("--format", "fmt", default="text", type=click.Choice(["text", "md", "json"]),
+              show_default=True)
+def findings(run_id: str | None, fmt: str):
+    """Show vulnerability findings from the last run (or a specific run_id).
+
+    Leads with what was found, the risk, and how to fix it.
+    ARS score appears last as the gate verdict.
+
+    \b
+    Examples:
+      crucible findings                    # last run
+      crucible findings crucible-2026-...  # specific run
+      crucible findings --format md        # markdown output for PRs
+    """
+    cfg = CrucibleConfig.load()
+    from .output.report import load_report, render_findings_summary
+
+    if run_id is None:
+        last_id_file = Path(".last_report_id")
+        if not last_id_file.exists():
+            console.print("[red]No recent run found.[/red] Run [bold]crucible run --issue ...[/bold] first.")
+            sys.exit(1)
+        run_id = last_id_file.read_text().strip()
+
+    try:
+        report = load_report(run_id, cfg.reports_dir)
+    except FileNotFoundError:
+        console.print(f"[red]Report '{run_id}' not found.[/red]")
+        sys.exit(1)
+
+    if fmt == "json":
+        attacks = report.get("attacks", [])
+        click.echo(json.dumps({
+            "run_id": run_id,
+            "ars_score": report["ars_score"],
+            "missed": [a for a in attacks if a["verdict"] == "MISSED"],
+            "partial": [a for a in attacks if a["verdict"] == "PARTIAL"],
+        }, indent=2))
+    elif fmt == "md":
+        click.echo(render_findings_summary(report))
+    else:
+        _print_run_summary(report, report["ars_score"] >= cfg.gate.minimum_ars)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# crucible integrate  — one-command IDE / platform setup
+# ──────────────────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.option(
+    "--platform",
+    type=click.Choice(["claude-code", "cursor", "windsurf", "copilot", "codex", "github-actions", "all"]),
+    default="all",
+    show_default=True,
+    help="Target IDE or platform",
+)
+@click.option("--dry-run", is_flag=True, help="Print config without writing files")
+def integrate(platform: str, dry_run: bool):
+    """One-command setup: wire CRUCIBLE into Claude Code, Copilot, Codex, GitHub Actions.
+
+    Writes the MCP server config and GitHub Actions workflow for the chosen platform.
+    Developers need zero manual configuration — just run this command.
+
+    \b
+    Examples:
+      crucible integrate                        # configure everything
+      crucible integrate --platform claude-code
+      crucible integrate --platform github-actions
+      crucible integrate --dry-run              # preview changes
+    """
+    import shutil
+
+    mcp_config = json.dumps({
+        "crucible": {
+            "command": str(shutil.which("crucible") or "crucible"),
+            "args": ["mcp-server"],
+            "env": {}
+        }
+    }, indent=2)
+
+    github_action = """\
+name: CRUCIBLE Adversarial Gate
+on:
+  pull_request:
+    branches: ["main", "master"]
+
+jobs:
+  crucible:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CRUCIBLE
+        run: pip install crucible-ai
+      - name: Run adversarial assessment
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          crucible run \\
+            --issue ${{ github.event.pull_request.body || 'examples/demo_issue.md' }} \\
+            --mode standard \\
+            --domain owasp_top10
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: .crucible/reports/
+"""
+
+    configs = {
+        "claude-code": {
+            "path": Path.home() / ".claude" / "mcp_servers.json",
+            "content": mcp_config,
+            "desc": "Claude Code MCP server config (~/.claude/mcp_servers.json)",
+        },
+        "cursor": {
+            "path": Path(".cursor") / "mcp.json",
+            "content": mcp_config,
+            "desc": "Cursor MCP config (.cursor/mcp.json)",
+        },
+        "windsurf": {
+            "path": Path.home() / ".codeium" / "windsurf" / "mcp_config.json",
+            "content": mcp_config,
+            "desc": "Windsurf MCP config",
+        },
+        "copilot": {
+            "path": Path(".vscode") / "mcp.json",
+            "content": mcp_config,
+            "desc": "GitHub Copilot / VS Code MCP config (.vscode/mcp.json)",
+        },
+        "codex": {
+            "path": Path(".codex") / "mcp.json",
+            "content": mcp_config,
+            "desc": "Codex MCP config (.codex/mcp.json)",
+        },
+        "github-actions": {
+            "path": Path(".github") / "workflows" / "crucible.yml",
+            "content": github_action,
+            "desc": "GitHub Actions adversarial gate (.github/workflows/crucible.yml)",
+        },
+    }
+
+    targets = list(configs.keys()) if platform == "all" else [platform]
+
+    console.print(f"\n[bold cyan]⚔  CRUCIBLE Integrate[/bold cyan]{'  [dim](dry run)[/dim]' if dry_run else ''}\n")
+
+    written = 0
+    for target in targets:
+        cfg_entry = configs[target]
+        dest: Path = cfg_entry["path"]
+        content: str = cfg_entry["content"]
+        desc: str = cfg_entry["desc"]
+
+        if dry_run:
+            console.print(f"  [dim]Would write:[/dim] {dest}")
+            console.print(f"  [dim]  ({desc})[/dim]")
+        else:
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                # For JSON MCP configs, merge rather than overwrite if file exists
+                if dest.exists() and dest.suffix == ".json":
+                    try:
+                        existing = json.loads(dest.read_text())
+                        new_entry = json.loads(content)
+                        existing.update(new_entry)
+                        dest.write_text(json.dumps(existing, indent=2))
+                    except Exception:
+                        dest.write_text(content)
+                else:
+                    dest.write_text(content)
+                console.print(f"  [green]✓[/green]  {desc}")
+                written += 1
+            except OSError as e:
+                console.print(f"  [yellow]⚠[/yellow]  {desc} — skipped ({e})")
+
+    if not dry_run:
+        console.print(f"\n[green]Done.[/green] {written}/{len(targets)} integration(s) configured.")
+        console.print("\nRestart your IDE, then ask it to run [bold]crucible_run[/bold] on any spec.")
+        console.print("Or: [bold]crucible run --issue examples/demo_issue.md --pretty[/bold]\n")
+    else:
+        console.print("\nRe-run without --dry-run to apply.\n")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 
 def _load_spec(issue: str) -> str | None:
+    """
+    Load a specification from multiple source types.
+
+    Primary (greenfield — spec-driven):
+      - Local spec file:   /path/to/SPEC.md  or  examples/demo_issue.md
+      - GitHub issue URL:  https://github.com/owner/repo/issues/42
+      - GitHub file URL:   https://github.com/owner/repo/blob/main/SPEC.md
+      - Any HTTP URL:      fetched as text (must return a readable spec)
+
+    Secondary (brownfield — existing codebase):
+      - Local folder:      /path/to/repo  (extracts spec docs; falls back to source)
+      - GitHub repo URL:   https://github.com/owner/repo  (clones, extracts spec docs)
+    """
     p = Path(issue)
-    if p.exists():
+
+    # Folder: concatenate all source files up to 100KB
+    if p.is_dir():
+        return _load_folder_spec(p)
+
+    # Local file
+    if p.is_file():
         return p.read_text()
-    if issue.startswith("http"):
-        # GitHub issue fetch (requires GITHUB_TOKEN or public repo)
+
+    if not issue.startswith("http"):
+        return None
+
+    # GitHub repo URL — must check before issue/blob patterns
+    gh_repo = _parse_github_repo_url(issue)
+    if gh_repo:
+        return _load_github_repo_spec(*gh_repo)
+
+    # GitHub issue API
+    gh_issue = _parse_github_issue_url(issue)
+    if gh_issue:
         try:
-            import httpx
-            resp = httpx.get(issue, headers={"Accept": "application/json"}, timeout=10)
+            import httpx, os
+            headers = {"Accept": "application/vnd.github+json"}
+            token = os.environ.get("GITHUB_TOKEN", "")
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            owner, repo, number = gh_issue
+            resp = httpx.get(
+                f"https://api.github.com/repos/{owner}/{repo}/issues/{number}",
+                headers=headers,
+                timeout=10,
+            )
             resp.raise_for_status()
             data = resp.json()
-            return data.get("body", "") or data.get("title", "")
+            title = data.get("title", "")
+            body  = data.get("body", "")
+            return f"# {title}\n\n{body}" if title else body
         except Exception:
-            return None
+            pass
+
+    # GitHub file (blob URL → raw)
+    raw_url = _github_blob_to_raw(issue)
+    if raw_url:
+        issue = raw_url
+
+    # Generic HTTP fetch
+    try:
+        import httpx
+        resp = httpx.get(issue, timeout=15, follow_redirects=True)
+        resp.raise_for_status()
+        return resp.text[:50_000]
+    except Exception:
+        return None
+
+
+def _load_folder_spec(folder: Path, max_bytes: int = 100_000) -> str | None:
+    """
+    Extract a specification from a folder.
+
+    Primary mode — looks for spec documents in this priority order:
+      1. SPEC.md, REQUIREMENTS.md, DESIGN.md, ARCHITECTURE.md at root
+      2. README.md at root
+      3. openapi.yaml / swagger.yaml (API contract)
+      4. docs/, design/, spec/, adr/ subdirectory Markdown files
+
+    Brownfield fallback — if no spec documents exist, concatenates source
+    files (Python, Go, Java, TypeScript, etc.) up to max_bytes. This is a
+    secondary mode for existing codebases without formal specs.
+    """
+    _SPEC_ROOTS = [
+        "SPEC.md", "spec.md",
+        "REQUIREMENTS.md", "requirements.md",
+        "DESIGN.md", "design.md",
+        "ARCHITECTURE.md", "architecture.md",
+        "README.md", "readme.md",
+        "openapi.yaml", "openapi.yml",
+        "swagger.yaml", "swagger.yml",
+        "api.yaml", "api.yml", "API.md",
+    ]
+    _SPEC_DIRS = {"docs", "doc", "design", "spec", "specs", "adr", "adrs", "design-docs"}
+
+    parts: list[str] = [f"# Specification: {folder.name}\n"]
+    total = 0
+
+    # ── Primary: root-level spec documents ───────────────────────────────────
+    for name in _SPEC_ROOTS:
+        p = folder / name
+        if p.exists() and p.is_file():
+            try:
+                content = p.read_text(encoding="utf-8", errors="ignore")[:12_000]
+                parts.append(f"\n## {name}\n\n{content}\n")
+                total += len(content)
+            except Exception:
+                pass
+
+    # ── Primary: spec subdirectory Markdown/YAML ─────────────────────────────
+    for dname in _SPEC_DIRS:
+        d = folder / dname
+        if d.is_dir():
+            for md in sorted(d.glob("*.md"))[:8]:
+                try:
+                    content = md.read_text(encoding="utf-8", errors="ignore")[:5_000]
+                    parts.append(f"\n## {md.relative_to(folder)}\n\n{content}\n")
+                    total += len(content)
+                    if total >= max_bytes:
+                        break
+                except Exception:
+                    pass
+            if total >= max_bytes:
+                break
+
+    if len(parts) > 1:
+        return "".join(parts)[:max_bytes]
+
+    # ── Brownfield fallback: concatenate source files ─────────────────────────
+    console.print("[yellow dim]  No spec documents found — falling back to brownfield mode "
+                  "(source file extraction). Consider adding a SPEC.md or README.md.[/yellow dim]")
+    extensions = {".py", ".java", ".go", ".js", ".ts", ".rb", ".cs"}
+    skip_dirs  = {".git", ".venv", "venv", "node_modules", "__pycache__", "dist", "build",
+                  ".gradle", "target", "vendor", ".idea", ".vscode"}
+
+    src_parts: list[str] = [f"# Brownfield Codebase: {folder.name}\n"]
+    src_total = 0
+    for path in sorted(folder.rglob("*")):
+        if any(skip in path.parts for skip in skip_dirs):
+            continue
+        if not path.is_file() or path.suffix not in extensions:
+            continue
+        rel = path.relative_to(folder)
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        snippet = content[:3_000]
+        chunk = f"\n## {rel}\n```{path.suffix.lstrip('.')}\n{snippet}\n```\n"
+        src_parts.append(chunk)
+        src_total += len(chunk)
+        if src_total >= max_bytes:
+            src_parts.append("\n[truncated — brownfield extraction limit reached]\n")
+            break
+
+    return "".join(src_parts) if len(src_parts) > 1 else None
+
+
+def _parse_github_issue_url(url: str):
+    """Return (owner, repo, number) or None."""
+    import re
+    m = re.match(r"https://github\.com/([^/]+)/([^/]+)/issues/(\d+)", url)
+    return (m.group(1), m.group(2), m.group(3)) if m else None
+
+
+def _github_blob_to_raw(url: str) -> str | None:
+    """Convert a GitHub blob URL to a raw content URL."""
+    import re
+    m = re.match(r"https://github\.com/([^/]+)/([^/]+)/blob/(.+)", url)
+    if m:
+        return f"https://raw.githubusercontent.com/{m.group(1)}/{m.group(2)}/{m.group(3)}"
     return None
 
 
-def _load_policy_context(cfg: CrucibleConfig, domains: list[str]) -> str:
+def _parse_github_repo_url(url: str):
+    """Return (owner, repo) if url is a bare GitHub repo URL, else None."""
+    import re
+    # Matches https://github.com/owner/repo  or  https://github.com/owner/repo.git
+    # Must NOT have extra path segments (issues, blob, tree, etc.)
+    m = re.match(r"https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$", url)
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _load_github_repo_spec(owner: str, repo: str) -> str | None:
+    """Shallow-clone a GitHub repo and load its source files as a spec."""
+    import os, shutil, subprocess, tempfile
+
+    clone_url = f"https://github.com/{owner}/{repo}.git"
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if token:
+        clone_url = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
+
+    console.print(f"[dim]  Cloning {owner}/{repo} (--depth 1)…[/dim]")
+    tmp = tempfile.mkdtemp(prefix="crucible-repo-")
+    try:
+        env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
+        result = subprocess.run(
+            ["git", "clone", "--depth=1", "--quiet", clone_url, tmp],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+        )
+        if result.returncode != 0 and "Clone succeeded" not in result.stderr:
+            console.print(f"[red]  git clone failed:[/red] {result.stderr.strip()}")
+            return None
+        spec = _load_folder_spec(Path(tmp))
+        if spec:
+            console.print(f"[dim]  Extracted spec from {owner}/{repo}[/dim]")
+        return spec
+    except FileNotFoundError:
+        console.print("[red]  git not found.[/red] Install git and retry.")
+        return None
+    except subprocess.TimeoutExpired:
+        console.print("[red]  git clone timed out (120s).[/red] Try a smaller repo.")
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _load_policy_context(domains: list[str]) -> str:
     from .policy.engine import load_domains, combine_policy_context, list_available_domains
     available = list_available_domains()
     valid = [d for d in domains if d.split("@")[0] in available]
@@ -954,13 +2437,53 @@ def _load_policy_context(cfg: CrucibleConfig, domains: list[str]) -> str:
         return ""
 
 
-def _load_recalled_attacks(spec: str, cfg: CrucibleConfig) -> str:
+def _load_recalled_attacks(spec: str) -> str:
     from .memory.forge import KnowledgeForge
     forge = KnowledgeForge()
     if not forge.is_available():
         return ""
     recalled = forge.recall_attacks(spec, n_results=10)
     return forge.format_recalled_for_prompt(recalled)
+
+
+def _check_config_ready(cfg: CrucibleConfig) -> list[tuple[str, str]]:
+    """Return list of (problem, fix) tuples. Empty means config is complete."""
+    import os
+    issues: list[tuple[str, str]] = []
+    provider = cfg.effective_model_provider
+
+    if provider == "openrouter":
+        if not os.environ.get("OPENROUTER_API_KEY"):
+            issues.append(
+                ("OPENROUTER_API_KEY is not set",
+                 "crucible setup --model  (choose OpenRouter and enter your API key)")
+            )
+        elif not cfg.deployment.openrouter_model:
+            issues.append(
+                ("OPENROUTER_MODEL is empty — no model selected",
+                 "crucible setup --model  (pick a model from the list)")
+            )
+    elif provider == "anthropic":
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            issues.append(
+                ("ANTHROPIC_API_KEY is not set",
+                 "crucible setup --model  (choose Anthropic and enter your API key)")
+            )
+    elif provider == "huggingface":
+        if not os.environ.get("HF_TOKEN"):
+            issues.append(
+                ("HF_TOKEN is not set",
+                 "crucible setup --model  (choose HuggingFace and enter your token)")
+            )
+    elif provider == "openai_compat":
+        if not os.environ.get("OPENAI_COMPAT_API_KEY"):
+            issues.append(
+                ("OPENAI_COMPAT_API_KEY is not set",
+                 "crucible setup --model  (choose OpenAI and enter your API key)")
+            )
+    # ollama: no key required — skip credential check
+
+    return issues
 
 
 async def _check_model(cfg: CrucibleConfig) -> bool:
@@ -1023,24 +2546,49 @@ def _print_checks(checks: list, all_pass: bool) -> None:
         console.print("\n[red]Some checks failed.[/red] Fix issues above before running.")
 
 
-def _print_run_summary(report: dict, passed: bool, cfg: CrucibleConfig) -> None:
+def _print_run_summary(report: dict, passed: bool) -> None:
+    """Vulnerability-first output: findings → remediation → ARS gate."""
+    from .output.report import get_remediation
+    attacks = report.get("attacks", [])
+    missed  = [a for a in attacks if a["verdict"] == "MISSED"]
+    partial = [a for a in attacks if a["verdict"] == "PARTIAL"]
     ars = report["ars_score"]
-    gate_icon = "[green]✅ PASSED[/green]" if passed else "[red]❌ BLOCKED[/red]"
 
-    console.print(f"\n{'─'*50}")
-    console.print(f"  [bold]ARS Score:[/bold]    {ars:.3f}  {gate_icon}")
-    console.print(f"  Attacks:      {report['attack_count']} fired")
-    console.print(f"  Mitigated:    {report['mitigated_count']}")
-    console.print(f"  Missed:       {report['miss_count']}")
-    console.print(f"  Elapsed:      {report['elapsed_seconds']}s")
-    console.print(f"  Report:       .crucible/reports/{report['run_id']}.json")
-    console.print(f"{'─'*50}\n")
+    # ── 1. Findings first ────────────────────────────────────────────────────
+    if missed:
+        console.print(f"\n[bold red]❌  {len(missed)} UNMITIGATED VULNERABILIT{'Y' if len(missed)==1 else 'IES'} FOUND[/bold red]")
+        for a in missed:
+            sev_color = {"critical": "red", "high": "yellow", "medium": "cyan", "low": "green"}.get(
+                a.get("severity", "medium").lower(), "white"
+            )
+            console.print(f"\n  [{sev_color}][{a['cwe']}] {a['title']}[/{sev_color}]  [{a.get('severity','?').upper()}]")
+            console.print(f"  [dim]{a['description'][:120]}[/dim]")
+            remediation = a.get("remediation") or get_remediation(a["cwe"])
+            console.print(f"  [bold]Fix:[/bold] {remediation}")
+    elif partial:
+        console.print(f"\n[yellow]⚠  {len(partial)} incompletely mitigated — review below[/yellow]")
+        for a in partial:
+            console.print(f"  [{a['cwe']}] {a['title']}")
+            remediation = a.get("remediation") or get_remediation(a["cwe"])
+            console.print(f"  [bold]Fix:[/bold] {remediation}")
+    elif not attacks:
+        console.print("\n[yellow]⚠  Breaker generated 0 attacks — model output unparseable or model failed.[/yellow]")
+        console.print("  [dim]Retry with --mode quick, or run `crucible setup` to switch to a more reliable model.[/dim]")
+    else:
+        console.print("\n[green]✅  No vulnerabilities found — all attacks mitigated.[/green]")
 
-    if not passed and report["miss_count"] > 0:
-        console.print("[bold]Top unmitigated attacks:[/bold]")
-        for a in report["attacks"]:
-            if a["verdict"] == "MISSED":
-                console.print(f"  [red]•[/red] [{a['cwe']}] {a['title']}")
+    # ── 2. ARS gate verdict ──────────────────────────────────────────────────
+    gate_style = "green" if passed else "red"
+    gate_label = "PASSED" if passed else "BLOCKED"
+    console.print(f"\n{'─'*52}")
+    console.print(f"  Adversarial Resilience Score: [{gate_style}]{ars:.3f}[/{gate_style}]  "
+                  f"[{gate_style}]{gate_label}[/{gate_style}]")
+    console.print(f"  {report['attack_count']} attacks  ·  "
+                  f"[green]{report['mitigated_count']} mitigated[/green]  ·  "
+                  f"[red]{report['miss_count']} missed[/red]  ·  "
+                  f"{report['elapsed_seconds']}s")
+    console.print(f"  Report: crucible report {report['run_id']} --format html")
+    console.print(f"{'─'*52}\n")
 
 
 def _load_recent_reports(reports_dir: Path, days: int) -> list[dict]:

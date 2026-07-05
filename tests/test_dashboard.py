@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import os
+
 from crucible.dashboard.app import (
+    _load_active_runs,
     _load_all_reports,
     _render_index,
     create_app,
@@ -46,6 +49,51 @@ def test_load_all_reports_respects_limit(tmp_path):
         )
     reports = _load_all_reports(tmp_path, limit=5)
     assert len(reports) == 5
+
+
+# ── _load_active_runs ────────────────────────────────────────────────────────
+
+def _make_run_state(run_id: str, status: str, pid: int, started_at: str = "2026-07-05T19:00:00+00:00",
+                     issue: str = "demo_issue.md", mode: str = "quick") -> dict:
+    return {"run_id": run_id, "status": status, "pid": pid, "started_at": started_at,
+            "issue": issue, "mode": mode}
+
+
+def test_load_active_runs_empty_dir(tmp_path):
+    assert _load_active_runs(tmp_path / "nonexistent") == []
+
+
+def test_load_active_runs_returns_running_with_live_pid(tmp_path):
+    # Use this test process's own PID — guaranteed alive for the test's duration.
+    (tmp_path / "run-a.json").write_text(
+        json.dumps(_make_run_state("crucible-run-a", "running", os.getpid()))
+    )
+    active = _load_active_runs(tmp_path)
+    assert len(active) == 1
+    assert active[0]["run_id"] == "crucible-run-a"
+    assert active[0]["issue"] == "demo_issue.md"
+    assert active[0]["mode"] == "quick"
+
+
+def test_load_active_runs_skips_dead_pid_and_cleans_up(tmp_path):
+    # PID 999999 is extremely unlikely to be alive.
+    state_file = tmp_path / "run-b.json"
+    state_file.write_text(json.dumps(_make_run_state("crucible-run-b", "running", 999999)))
+    active = _load_active_runs(tmp_path)
+    assert active == []
+    assert not state_file.exists()  # stale state file cleaned up
+
+
+def test_load_active_runs_ignores_completed_status(tmp_path):
+    (tmp_path / "run-c.json").write_text(
+        json.dumps(_make_run_state("crucible-run-c", "completed", os.getpid()))
+    )
+    assert _load_active_runs(tmp_path) == []
+
+
+def test_load_active_runs_skips_corrupt_json(tmp_path):
+    (tmp_path / "bad.json").write_text("NOT JSON {{{")
+    assert _load_active_runs(tmp_path) == []
 
 
 # ── _render_index ──────────────────────────────────────────────────────────────
@@ -89,7 +137,7 @@ def test_render_index_shows_pass_fail_badges():
     ]
     html = _render_index(reports, cfg)
     assert "PASS" in html
-    assert "FAIL" in html
+    assert "BLOCKED" in html  # redesign: failed runs show BLOCKED not FAIL
 
 
 def test_render_index_download_links_present():
@@ -110,8 +158,8 @@ def test_render_index_empty_shows_empty_message():
 def test_render_index_has_bright_background():
     cfg = CrucibleConfig()
     html = _render_index([], cfg)
-    # Light theme — no dark background colors
-    assert "#F8FAFC" in html or "#FAFAFA" in html
+    # Light theme — bright blue-white palette
+    assert "#EFF6FF" in html or "#F0F7FF" in html or "#DBEAFE" in html
     assert "#1a1a1a" not in html  # not dark mode
 
 
@@ -121,6 +169,23 @@ def test_render_index_has_ars_trend_section():
     html = _render_index(reports, cfg)
     assert "ARS Trend" in html
     assert "sparkline" in html or "svg" in html.lower()
+
+
+def test_render_index_shows_active_runs():
+    cfg = CrucibleConfig()
+    active = [{"run_id": "crucible-active-001", "issue": "demo_issue.md",
+               "mode": "quick", "elapsed_seconds": 72.0, "elapsed": "1m 12s"}]
+    html = _render_index([], cfg, active)
+    assert "RUNNING" in html
+    assert "Active Runs (1)" in html
+    assert "1m 12s" in html
+
+
+def test_render_index_no_active_runs_shows_nothing_extra():
+    cfg = CrucibleConfig()
+    html = _render_index([], cfg, [])
+    assert "Active Runs" not in html
+    assert "RUNNING" not in html
 
 
 def test_render_index_chart_data_is_valid_json():
@@ -163,7 +228,74 @@ def test_create_app_returns_fastapi_instance():
     routes = [r.path for r in app.routes]
     assert "/" in routes
     assert "/api/runs" in routes
+    assert "/api/runs/active" in routes
     assert "/health" in routes
+
+
+# ── live endpoints (active runs + status) ──────────────────────────────────────
+
+def _client(tmp_path):
+    import pytest
+    try:
+        from fastapi.testclient import TestClient
+    except ImportError:
+        pytest.skip("fastapi not installed — skipping live app test")
+    cfg = CrucibleConfig()
+    cfg.reports_dir = tmp_path / "reports"
+    return TestClient(create_app(cfg)), cfg
+
+
+def test_api_runs_active_endpoint_reflects_running_process(tmp_path):
+    client, _ = _client(tmp_path)
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+    (runs_dir / "r1.json").write_text(
+        json.dumps(_make_run_state("crucible-live-001", "running", os.getpid()))
+    )
+    resp = client.get("/api/runs/active")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    assert data[0]["run_id"] == "crucible-live-001"
+
+
+def test_api_runs_active_endpoint_not_shadowed_by_run_id_route(tmp_path):
+    """/api/runs/active must resolve to the active-runs list, not /api/runs/{run_id}
+    with run_id='active' (a 404) — route registration order matters in FastAPI."""
+    client, _ = _client(tmp_path)
+    resp = client.get("/api/runs/active")
+    assert resp.status_code == 200
+    assert isinstance(resp.json(), list)
+
+
+def test_status_page_reflects_configured_provider_not_hardcoded(tmp_path):
+    import pytest
+    try:
+        from fastapi.testclient import TestClient
+    except ImportError:
+        pytest.skip("fastapi not installed — skipping live app test")
+    cfg = CrucibleConfig()
+    cfg.reports_dir = tmp_path / "reports"
+    cfg.deployment.model_provider = "anthropic"
+    client = TestClient(create_app(cfg))
+
+    resp = client.get("/status")
+    assert resp.status_code == 200
+    # Must reflect this config's actual provider, not the old hardcoded OpenRouter string.
+    assert "Anthropic" in resp.text
+    assert cfg.deployment.anthropic_model in resp.text
+    assert "openai/gpt-oss-20b" not in resp.text  # the old hardcoded value
+
+
+def test_status_page_shows_active_run_count(tmp_path):
+    client, _ = _client(tmp_path)
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+    (runs_dir / "r1.json").write_text(
+        json.dumps(_make_run_state("crucible-live-002", "running", os.getpid()))
+    )
+    resp = client.get("/status")
+    assert "Active Runs" in resp.text
 
 
 # ── pyproject.toml [ui] extra ──────────────────────────────────────────────────

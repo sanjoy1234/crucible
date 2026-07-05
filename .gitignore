@@ -50,3 +50,6 @@ htmlcov/
 .env.local
 *.pem
 secrets.json
+
+# Claude Code workspace config — not for public repo
+CLAUDE.md

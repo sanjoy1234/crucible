@@ -87,75 +87,88 @@ class CrucibleConfig:
         """Load config from .crucible.yml, walking up from cwd if path not given."""
         if path is None:
             path = _find_config()
-        if path is None or not Path(path).exists():
-            return cls()
-
-        with open(path) as f:
-            raw = yaml.safe_load(f) or {}
 
         cfg = cls()
-        cfg.version = raw.get("version", 1)
+        deployment_explicit = False
 
-        if cp := raw.get("combat_pair"):
-            cfg.combat_pair = CombatPairConfig(
-                attack_count=cp.get("attack_count", 20),
-                rounds_max=cp.get("rounds_max", 5),
-                cwe_rotation=cp.get("cwe_rotation", True),
-                early_exit_threshold=cp.get("early_exit_threshold", 0.95),
-                early_exit_streak=cp.get("early_exit_streak", 3),
-                break_context_enabled=cp.get("break_context_enabled", True),
-            )
+        if path is not None and Path(path).exists():
+            with open(path) as f:
+                raw = yaml.safe_load(f) or {}
 
-        if p := raw.get("policy"):
-            cfg.policy = PolicyConfig(domains=p.get("domains", ["owasp_top10@2025.1"]))
+            cfg.version = raw.get("version", 1)
 
-        if g := raw.get("gate"):
-            cfg.gate = GateConfig(
-                minimum_ars=g.get("minimum_ars", 0.80),
-                fail_open=g.get("fail_open", False),
-                exempt_labels=g.get("exempt_labels", ["crucible-exempt", "hotfix"]),
-            )
+            if cp := raw.get("combat_pair"):
+                cfg.combat_pair = CombatPairConfig(
+                    attack_count=cp.get("attack_count", 20),
+                    rounds_max=cp.get("rounds_max", 5),
+                    cwe_rotation=cp.get("cwe_rotation", True),
+                    early_exit_threshold=cp.get("early_exit_threshold", 0.95),
+                    early_exit_streak=cp.get("early_exit_streak", 3),
+                    break_context_enabled=cp.get("break_context_enabled", True),
+                )
 
-        if d := raw.get("deployment"):
-            cfg.deployment = DeploymentConfig(
-                model_provider=d.get("model_provider", "local"),
-                local_model=d.get("local_model", "llama3.1:8b"),
-                local_endpoint=d.get("local_endpoint", "http://localhost:11434"),
-                anthropic_model=d.get("anthropic_model", "claude-haiku-4-5-20251001"),
-                openrouter_model=d.get("openrouter_model", "meta-llama/llama-3.3-70b-instruct:free"),
-                huggingface_model=d.get("huggingface_model", "meta-llama/Llama-3.1-70B-Instruct"),
-                openai_compat_endpoint=d.get("openai_compat_endpoint", "http://localhost:8000/v1"),
-                openai_compat_model=d.get("openai_compat_model", "llama3.1:8b"),
-            )
+            if p := raw.get("policy"):
+                cfg.policy = PolicyConfig(domains=p.get("domains", ["owasp_top10@2025.1"]))
 
-        if r := raw.get("rbac"):
-            cfg.rbac = RbacConfig(
-                admin_teams=r.get("admin_teams", []),
-                reviewer_teams=r.get("reviewer_teams", []),
-            )
+            if g := raw.get("gate"):
+                cfg.gate = GateConfig(
+                    minimum_ars=g.get("minimum_ars", 0.80),
+                    fail_open=g.get("fail_open", False),
+                    exempt_labels=g.get("exempt_labels", ["crucible-exempt", "hotfix"]),
+                )
 
-        if n := raw.get("notifications"):
-            cfg.notifications = NotificationsConfig(
-                jira_project=n.get("jira_project", ""),
-                slack_webhook=n.get("slack_webhook", ""),
-            )
+            if d := raw.get("deployment"):
+                cfg.deployment = DeploymentConfig(
+                    model_provider=d.get("model_provider", "local"),
+                    local_model=d.get("local_model", "llama3.1:8b"),
+                    local_endpoint=d.get("local_endpoint", "http://localhost:11434"),
+                    anthropic_model=d.get("anthropic_model", "claude-haiku-4-5-20251001"),
+                    openrouter_model=d.get("openrouter_model", "meta-llama/llama-3.3-70b-instruct:free"),
+                    huggingface_model=d.get("huggingface_model", "meta-llama/Llama-3.1-70B-Instruct"),
+                    openai_compat_endpoint=d.get("openai_compat_endpoint", "http://localhost:8000/v1"),
+                    openai_compat_model=d.get("openai_compat_model", "llama3.1:8b"),
+                )
+                deployment_explicit = True
 
-        cfg.retention_days = raw.get("retention_days", 365)
-        cfg.community_brain = raw.get("community_brain", False)
-        cfg.mcp_servers = raw.get("mcp_servers", [])
-        cfg.nvd_enabled = raw.get("nvd_enabled", False)
-        cfg.kev_enabled = raw.get("kev_enabled", True)
-        cfg.nvd_lookback_days = raw.get("nvd_lookback_days", 90)
+            if r := raw.get("rbac"):
+                cfg.rbac = RbacConfig(
+                    admin_teams=r.get("admin_teams", []),
+                    reviewer_teams=r.get("reviewer_teams", []),
+                )
 
-        # Env var overrides — order matters (most specific wins)
-        if os.environ.get("OPENROUTER_API_KEY"):
-            cfg.deployment.model_provider = "openrouter"
-        elif os.environ.get("ANTHROPIC_API_KEY"):
-            cfg.deployment.model_provider = "anthropic"
-        elif os.environ.get("HF_TOKEN"):
-            cfg.deployment.model_provider = "huggingface"
+            if n := raw.get("notifications"):
+                cfg.notifications = NotificationsConfig(
+                    jira_project=n.get("jira_project", ""),
+                    slack_webhook=n.get("slack_webhook", ""),
+                )
+
+            cfg.retention_days = raw.get("retention_days", 365)
+            cfg.community_brain = raw.get("community_brain", False)
+            cfg.mcp_servers = raw.get("mcp_servers", [])
+            cfg.nvd_enabled = raw.get("nvd_enabled", False)
+            cfg.kev_enabled = raw.get("kev_enabled", True)
+            cfg.nvd_lookback_days = raw.get("nvd_lookback_days", 90)
+
+        # MODEL_PROVIDER is written by `crucible setup` on every model reconfiguration —
+        # it is the user's most recent explicit choice and always wins. It must never be
+        # silently overridden by guessing from whichever API key happens to be set.
+        if p := os.environ.get("MODEL_PROVIDER"):
+            cfg.deployment.model_provider = p
+        elif not deployment_explicit:
+            # No explicit `deployment:` section in .crucible.yml (and no MODEL_PROVIDER
+            # recorded yet) — fall back to detecting the provider from whichever key is
+            # present. This only exists for zero-config / CI deployments; it never
+            # overrides an explicit choice made via .crucible.yml or `crucible setup`.
+            if os.environ.get("OPENROUTER_API_KEY"):
+                cfg.deployment.model_provider = "openrouter"
+            elif os.environ.get("ANTHROPIC_API_KEY"):
+                cfg.deployment.model_provider = "anthropic"
+            elif os.environ.get("HF_TOKEN"):
+                cfg.deployment.model_provider = "huggingface"
 
         # Per-provider model overrides
+        if m := os.environ.get("OLLAMA_MODEL"):
+            cfg.deployment.local_model = m
         if m := os.environ.get("OPENROUTER_MODEL"):
             cfg.deployment.openrouter_model = m
         if m := os.environ.get("HF_MODEL"):
@@ -190,12 +203,8 @@ class CrucibleConfig:
 
     @property
     def effective_model_provider(self) -> str:
-        if os.environ.get("OPENROUTER_API_KEY"):
-            return "openrouter"
-        if os.environ.get("ANTHROPIC_API_KEY"):
-            return "anthropic"
-        if os.environ.get("HF_TOKEN"):
-            return "huggingface"
+        """The provider actually in effect. Resolved once in `load()` — no live
+        re-derivation here, so it can never disagree with what `load()` decided."""
         return self.deployment.model_provider
 
 

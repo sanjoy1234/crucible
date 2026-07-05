@@ -81,8 +81,9 @@ class Breaker(BaseAgent):
         round_number: int = 1,
         cwe_override: list[str] | None = None,
         recalled_attacks: str = "",
+        intent_context: str = "",
     ) -> BreakerResult:
-        """Generate attacks against a spec or code snippet."""
+        """Generate attacks against a spec or code snippet, enriched with business intent."""
         cwes = cwe_override or self._select_cwes(round_number)
         self._used_cwes.extend(cwes)
 
@@ -98,6 +99,16 @@ class Breaker(BaseAgent):
             enabled=self.break_context_enabled,
         )
 
+        # Intent + Spec: business intent widens the attack surface beyond the spec alone.
+        # A FINRA AML requirement + a spec saying "score this transaction" creates
+        # a vulnerability surface that neither document creates alone.
+        intent_section = ""
+        if intent_context:
+            intent_section = (
+                f"\nBusiness intent (attack surface is spec + intent combined):\n"
+                f"{intent_context[:2000]}\n"
+            )
+
         policy_section = ""
         if self.policy_context:
             policy_section = f"\nCompliance context:\n{self.policy_context}\n"
@@ -110,8 +121,9 @@ class Breaker(BaseAgent):
             )
 
         prompt = (
-            f"Target (attack this):\n```\n{c_target}\n```\n\n"
-            f"Assigned CWE categories for this round:\n{c_cwe}"
+            f"Target (attack this):\n```\n{c_target}\n```\n"
+            f"{intent_section}"
+            f"\nAssigned CWE categories for this round:\n{c_cwe}"
             f"{policy_section}"
             f"{recalled_section}\n"
             f"Generate adversarial attacks. Return JSON array only."
@@ -153,30 +165,64 @@ class Breaker(BaseAgent):
         return -sum((v / total) * math.log2(v / total) for v in freq.values())
 
 
-def _parse_attacks(text: str, round_number: int) -> list[Attack]:
-    import re
+def _extract_outermost_array(text: str) -> str | None:
+    """Find the outermost [...] JSON array in text, respecting nested brackets and strings."""
+    start = text.find('[')
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape_next = False
+    for i, ch in enumerate(text[start:], start):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == '[':
+            depth += 1
+        elif ch == ']':
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
 
-    json_match = re.search(r"\[.*?\]", text, re.DOTALL)
-    if not json_match:
+
+def _parse_attacks(text: str, round_number: int) -> list[Attack]:
+    # Strip markdown code fences that some models wrap around JSON
+    text = text.replace("```json", "").replace("```", "")
+    extracted = _extract_outermost_array(text)
+    if extracted is None:
         return []
     try:
-        raw = json.loads(json_match.group())
+        raw = json.loads(extracted)
     except json.JSONDecodeError:
         return []
 
     attacks = []
     for i, item in enumerate(raw if isinstance(raw, list) else []):
-        attacks.append(
-            Attack(
-                id=item.get("id", f"atk-{round_number:02d}{i+1:02d}"),
-                cwe=item.get("cwe", "CWE-UNKNOWN"),
-                title=item.get("title", "Unnamed attack"),
-                description=item.get("description", ""),
-                line_hint=item.get("line_hint", ""),
-                confidence=int(item.get("confidence", 5)),
-                severity=item.get("severity", "medium"),
+        if not isinstance(item, dict):
+            continue
+        try:
+            attacks.append(
+                Attack(
+                    id=item.get("id", f"atk-{round_number:02d}{i+1:02d}"),
+                    cwe=item.get("cwe", "CWE-UNKNOWN"),
+                    title=item.get("title", "Unnamed attack"),
+                    description=item.get("description", ""),
+                    line_hint=item.get("line_hint", ""),
+                    confidence=int(item.get("confidence", 5)),
+                    severity=item.get("severity", "medium"),
+                )
             )
-        )
+        except (TypeError, ValueError):
+            continue
     return attacks
 
 

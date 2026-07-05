@@ -14,7 +14,6 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..agents.breaker import Attack
 from ..core.combat_pair import CombatResult
 
 CONTROL_MAPPINGS = {
@@ -31,12 +30,40 @@ def generate_run_id() -> str:
     return f"crucible-{ts}-{suffix}"
 
 
+_REMEDIATION_HINTS: dict[str, str] = {
+    "CWE-89":  "Use parameterized queries or prepared statements. Never concatenate user input into SQL.",
+    "CWE-79":  "Escape all output with context-aware encoding. Use a trusted templating engine with auto-escape.",
+    "CWE-22":  "Canonicalize paths and validate they remain within the allowed base directory.",
+    "CWE-78":  "Avoid shell=True. Use subprocess with argument lists. Validate and whitelist all inputs.",
+    "CWE-352": "Require CSRF tokens on all state-changing requests. Use SameSite cookies.",
+    "CWE-862": "Enforce authorization checks server-side on every request. Never trust client-side roles.",
+    "CWE-306": "Add authentication to all sensitive endpoints. Do not rely on obscurity.",
+    "CWE-502": "Avoid deserializing untrusted data. Use safe formats (JSON) with schema validation.",
+    "CWE-918": "Validate and allowlist outbound URLs. Never forward raw user-supplied URLs.",
+    "CWE-611": "Disable external entity processing in your XML parser. Use a safe configuration.",
+    "CWE-434": "Validate file type by content (magic bytes), not extension. Store uploads outside web root.",
+    "CWE-798": "Remove hardcoded credentials. Use environment variables or a secrets manager.",
+    "CWE-200": "Audit all error messages and logs. Never expose stack traces or internal paths to clients.",
+    "CWE-362": "Use proper locking (mutexes/semaphores). Identify and protect all shared state.",
+    "CWE-476": "Add null checks before dereferencing. Use Optional types where appropriate.",
+    "CWE-190": "Use checked arithmetic or big-integer types. Validate ranges before arithmetic operations.",
+    "CWE-125": "Use safe array bounds checking. Prefer standard library containers with bounds enforcement.",
+    "CWE-787": "Validate buffer sizes before writes. Use memory-safe languages or safe abstractions.",
+}
+
+
+def get_remediation(cwe: str) -> str:
+    """Return a concise remediation hint for a CWE."""
+    return _REMEDIATION_HINTS.get(cwe, "Review the CWE definition and apply defense-in-depth controls.")
+
+
 def build_report(
     result: CombatResult,
     run_id: str,
     spec_ref: str = "",
     commit_sha: str = "",
     playbook_version: str = "owasp_top10@v2025.1",
+    intent_ref: str = "",
 ) -> dict:
     """Build the structured Resilience Report as a Python dict (serializable to JSON)."""
     attacks_serialized = [
@@ -50,10 +77,12 @@ def build_report(
             "severity": a.severity,
             "score": a.score,
             "verdict": _score_to_verdict(a.score),
+            "remediation": get_remediation(a.cwe),
         }
         for a in result.all_attacks
     ]
 
+    # Hash is computed AFTER remediation is included so verify_integrity stays consistent
     integrity_hash = _compute_hash(attacks_serialized)
 
     return {
@@ -61,6 +90,7 @@ def build_report(
         "run_id": run_id,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "spec_ref": spec_ref,
+        "intent_ref": intent_ref,
         "commit_sha": commit_sha,
         "ars_score": result.final_ars,
         "attack_count": result.attack_count,
@@ -100,16 +130,65 @@ def verify_integrity(report: dict) -> bool:
     return stored == derived
 
 
+def render_findings_summary(report: dict) -> str:
+    """
+    Vulnerability-first summary: what was found, what is the risk, how to fix it.
+    ARS score appears last as the gate verdict — not the headline.
+    """
+    attacks = report.get("attacks", [])
+    missed = [a for a in attacks if a.get("verdict") == "MISSED"]
+    partial = [a for a in attacks if a.get("verdict") == "PARTIAL"]
+    ars = report["ars_score"]
+    gate = "PASSED" if ars >= 0.80 else "BLOCKED"
+
+    lines = ["## CRUCIBLE Security Findings", ""]
+
+    if not missed and not partial:
+        lines.append("✅  No unmitigated vulnerabilities found in this run.")
+    else:
+        if missed:
+            lines += [f"### ❌  Critical — {len(missed)} Unmitigated Vulnerability(ies)", ""]
+            for a in missed:
+                lines += [
+                    f"**[{a['cwe']}] {a['title']}** · Severity: {a['severity'].upper()}",
+                    f"  {a['description']}",
+                    f"  **Fix:** {a.get('remediation', get_remediation(a['cwe']))}",
+                    "",
+                ]
+        if partial:
+            lines += [f"### ⚠️  Partial — {len(partial)} Incompletely Mitigated", ""]
+            for a in partial:
+                lines += [
+                    f"**[{a['cwe']}] {a['title']}** · Severity: {a['severity'].upper()}",
+                    f"  {a['description']}",
+                    f"  **Fix:** {a.get('remediation', get_remediation(a['cwe']))}",
+                    "",
+                ]
+
+    lines += [
+        "---",
+        f"**Adversarial Resilience Score: {ars:.2f}** · Gate: {gate} · "
+        f"{report['attack_count']} attacks · {report['miss_count']} missed · "
+        f"{report['elapsed_seconds']}s",
+        f"`Run: {report['run_id']}`",
+    ]
+    return "\n".join(lines)
+
+
 def render_markdown(report: dict) -> str:
     ars = report["ars_score"]
-    gate = "✅ PASSED" if ars >= 0.80 else "❌ FAILED"
+    gate = "✅ PASSED" if ars >= 0.80 else "❌ BLOCKED"
     verdict_icon = {
         "MITIGATED": "✅", "PARTIAL": "⚠️", "MISSED": "❌"
     }
 
+    # Lead with findings, not the score
     lines = [
-        f"## 🛡️ CRUCIBLE Resilience Report",
-        f"",
+        render_findings_summary(report),
+        "",
+        "---",
+        "## Full Attack Breakdown",
+        "",
         f"| Field | Value |",
         f"|-------|-------|",
         f"| Run ID | `{report['run_id']}` |",
@@ -120,16 +199,15 @@ def render_markdown(report: dict) -> str:
         f"| Elapsed | {report['elapsed_seconds']}s |",
         f"| Playbook | `{report['playbook_version']}` |",
         f"",
-        f"### Attack Breakdown",
-        f"",
-        f"| ID | CWE | Title | Severity | Verdict |",
-        f"|----|-----|-------|----------|---------|",
+        f"| ID | CWE | Title | Severity | Verdict | Remediation |",
+        f"|----|-----|-------|----------|---------|-------------|",
     ]
 
     for a in report.get("attacks", []):
         icon = verdict_icon.get(a["verdict"], "?")
+        remediation = a.get("remediation", get_remediation(a["cwe"]))
         lines.append(
-            f"| {a['id']} | `{a['cwe']}` | {a['title']} | {a['severity']} | {icon} {a['verdict']} |"
+            f"| {a['id']} | `{a['cwe']}` | {a['title']} | {a['severity']} | {icon} {a['verdict']} | {remediation[:80]}... |"
         )
 
     lines += [
@@ -153,86 +231,167 @@ def render_markdown(report: dict) -> str:
 
 
 def render_html(report: dict) -> str:
-    """Render a self-contained HTML Resilience Report viewable in any browser."""
+    """Render a self-contained HTML Resilience Report — findings first, bright colors."""
     ars = report["ars_score"]
     gate = "PASSED" if ars >= 0.80 else "BLOCKED"
-    gate_color = "#047857" if ars >= 0.80 else "#B91C1C"
-    ars_pct = int(ars * 100)
+    gate_color = "#059669" if ars >= 0.80 else "#DC2626"
+    gate_bg = "#D1FAE5" if ars >= 0.80 else "#FEE2E2"
 
-    verdict_color = {"MITIGATED": "#047857", "PARTIAL": "#92400E", "MISSED": "#B91C1C"}
-    verdict_icon = {"MITIGATED": "✅", "PARTIAL": "⚠️", "MISSED": "❌"}
+    attacks = report.get("attacks", [])
+    missed = [a for a in attacks if a.get("verdict") == "MISSED"]
+    partial = [a for a in attacks if a.get("verdict") == "PARTIAL"]
 
-    attack_rows = ""
-    for a in report.get("attacks", []):
+    # ── Findings cards (vulnerability-first) ─────────────────────────────────
+    finding_cards = ""
+    sev_colors = {
+        "critical": ("#7F1D1D", "#FEF2F2", "#FCA5A5"),
+        "high":     ("#92400E", "#FFFBEB", "#FCD34D"),
+        "medium":   ("#1E40AF", "#EFF6FF", "#93C5FD"),
+        "low":      ("#065F46", "#F0FDF4", "#6EE7B7"),
+    }
+    for a in missed + partial:
+        sev = a.get("severity", "medium").lower()
+        txt_col, bg_col, border_col = sev_colors.get(sev, ("#374151", "#F9FAFB", "#D1D5DB"))
+        verdict_label = "❌ UNMITIGATED" if a["verdict"] == "MISSED" else "⚠️ PARTIAL"
+        remediation = a.get("remediation", get_remediation(a["cwe"]))
+        finding_cards += f"""
+<div class="finding-card" style="border-left:4px solid {border_col};background:{bg_col}">
+  <div class="finding-header">
+    <span class="finding-cwe" style="background:{border_col};color:{txt_col}">{a['cwe']}</span>
+    <span class="finding-title">{a['title']}</span>
+    <span class="finding-sev" style="color:{txt_col}">{sev.upper()}</span>
+    <span class="verdict-tag" style="color:{txt_col}">{verdict_label}</span>
+  </div>
+  <p class="finding-desc">{a['description']}</p>
+  <div class="finding-fix"><strong>Fix:</strong> {remediation}</div>
+</div>"""
+
+    all_rows = ""
+    _v_icon = {"MITIGATED": "&#x2705;", "PARTIAL": "&#x26A0;&#xFE0F;", "MISSED": "&#x274C;"}
+    _v_color = {"MITIGATED": "#059669", "PARTIAL": "#D97706", "MISSED": "#DC2626"}
+    for a in attacks:
         v = a["verdict"]
-        color = verdict_color.get(v, "#111")
-        icon = verdict_icon.get(v, "?")
-        attack_rows += (
-            f"<tr>"
-            f"<td><code>{a['id']}</code></td>"
-            f"<td><code>{a['cwe']}</code></td>"
-            f"<td>{a['title']}</td>"
-            f"<td>{a.get('severity', '—')}</td>"
-            f"<td style='color:{color};font-weight:600'>{icon} {v}</td>"
-            f"</tr>\n"
+        v_col = _v_color.get(v, "#111827")
+        v_ico = _v_icon.get(v, "?")
+        a_id = a["id"]
+        a_cwe = a["cwe"]
+        a_title = a["title"]
+        a_sev = a.get("severity", "—").upper()
+        a_rem = a.get("remediation", get_remediation(a["cwe"]))[:90]
+        all_rows += (
+            "<tr>"
+            f"<td><code>{a_id}</code></td>"
+            f"<td><code style=\"background:#EFF6FF;color:#1E40AF;padding:2px 6px;border-radius:3px\">{a_cwe}</code></td>"
+            f"<td style=\"font-weight:500\">{a_title}</td>"
+            f"<td>{a_sev}</td>"
+            f"<td style=\"color:{v_col};font-weight:700\">{v_ico} {v}</td>"
+            f"<td style=\"font-size:12px;color:#6B7280\">{a_rem}&#x2026;</td>"
+            "</tr>\n"
         )
 
     control_rows = ""
     for framework, controls in report.get("control_mappings", {}).items():
-        control_rows += f"<tr><td><strong>{framework}</strong></td><td>{', '.join(controls)}</td></tr>\n"
+        ctrl_str = ", ".join(controls)
+        control_rows += f"<tr><td><strong style=\"color:#1E40AF\">{framework}</strong></td><td>{ctrl_str}</td></tr>\n"
+
+    intent_meta = ""
+    if report.get("intent_ref"):
+        intent_meta = f"&nbsp;·&nbsp; Intent: <a href='{report['intent_ref']}' style='color:#2563EB'>{report['intent_ref']}</a>"
+
+    no_findings_msg = ""
+    if not missed and not partial:
+        no_findings_msg = """
+<div style="background:#D1FAE5;border:1px solid #6EE7B7;border-radius:8px;padding:20px 24px;margin-bottom:24px;display:flex;align-items:center;gap:12px">
+  <span style="font-size:28px">✅</span>
+  <div>
+    <div style="font-weight:700;color:#065F46;font-size:15px">No unmitigated vulnerabilities found</div>
+    <div style="color:#047857;font-size:13px;margin-top:2px">All adversarial attacks were mitigated or partially addressed.</div>
+  </div>
+</div>"""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>CRUCIBLE Resilience Report — {report['run_id']}</title>
 <style>
-  body{{font-family:system-ui,-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:40px 24px;background:#FAFAFA;color:#111827}}
-  h1{{font-size:22px;font-weight:700;margin-bottom:4px}}
-  .meta{{font-size:12px;color:#6B7280;font-family:monospace;margin-bottom:32px}}
-  .score-box{{background:#fff;border:1px solid #E5E7EB;border-radius:8px;padding:20px 24px;display:flex;align-items:center;gap:32px;margin-bottom:24px}}
-  .ars-num{{font-size:48px;font-weight:800;color:{gate_color};line-height:1}}
-  .gate-badge{{background:{gate_color};color:#fff;padding:4px 12px;border-radius:4px;font-size:13px;font-weight:700}}
-  .stat{{font-size:13px;color:#374151}}.stat strong{{font-size:18px;display:block}}
-  table{{width:100%;border-collapse:collapse;font-size:13.5px;background:#fff;border-radius:8px;overflow:hidden;border:1px solid #E5E7EB;margin-bottom:24px}}
-  th{{background:#F3F4F6;padding:10px 14px;text-align:left;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#6B7280}}
-  td{{padding:10px 14px;border-top:1px solid #F3F4F6}}
-  code{{font-family:monospace;font-size:11px;background:#F3F4F6;padding:1px 5px;border-radius:3px}}
-  .integrity{{font-size:11px;color:#9CA3AF;font-family:monospace;margin-top:24px;padding-top:16px;border-top:1px solid #E5E7EB}}
-  h2{{font-size:15px;font-weight:700;margin:28px 0 12px}}
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#F0F7FF;color:#111827;min-height:100vh}}
+  header{{background:linear-gradient(135deg,#1E40AF 0%,#3B82F6 100%);padding:20px 32px;color:#fff}}
+  header h1{{font-size:20px;font-weight:800;letter-spacing:-.01em}}
+  header .meta{{font-size:12px;opacity:.8;margin-top:4px;font-family:monospace}}
+  .main{{max-width:1000px;margin:0 auto;padding:28px 24px}}
+  .gate-bar{{display:flex;align-items:center;gap:20px;background:#fff;border-radius:10px;padding:20px 24px;margin-bottom:20px;border:1px solid #DBEAFE;box-shadow:0 1px 4px rgba(0,0,0,.06)}}
+  .gate-verdict{{font-size:28px;font-weight:900;color:{gate_color}}}
+  .gate-badge{{background:{gate_bg};color:{gate_color};border:1.5px solid {gate_color};border-radius:6px;padding:4px 14px;font-size:13px;font-weight:800;letter-spacing:.04em}}
+  .ars-label{{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:#6B7280}}
+  .stat-chips{{display:flex;gap:10px;flex-wrap:wrap;margin-left:auto}}
+  .chip{{background:#EFF6FF;color:#1E40AF;border-radius:20px;padding:4px 12px;font-size:12px;font-weight:700}}
+  .chip.red{{background:#FEE2E2;color:#DC2626}}
+  .chip.amber{{background:#FFFBEB;color:#D97706}}
+  .chip.green{{background:#D1FAE5;color:#059669}}
+  .section-title{{font-size:14px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;color:#1E40AF;margin:24px 0 12px;display:flex;align-items:center;gap:8px}}
+  .finding-card{{border-radius:8px;padding:16px 18px;margin-bottom:12px}}
+  .finding-header{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}}
+  .finding-cwe{{font-family:monospace;font-size:11px;font-weight:800;padding:2px 8px;border-radius:4px}}
+  .finding-title{{font-weight:700;font-size:14px;color:#111827;flex:1}}
+  .finding-sev{{font-size:11px;font-weight:800;letter-spacing:.05em}}
+  .verdict-tag{{font-size:11px;font-weight:700;margin-left:auto}}
+  .finding-desc{{font-size:13px;color:#374151;line-height:1.5;margin-bottom:10px}}
+  .finding-fix{{font-size:12px;background:rgba(255,255,255,.7);border-radius:4px;padding:8px 12px;color:#374151;border-left:3px solid #3B82F6}}
+  table{{width:100%;border-collapse:collapse;font-size:13px;background:#fff;border-radius:8px;overflow:hidden;border:1px solid #DBEAFE;margin-bottom:20px}}
+  th{{background:#EFF6FF;padding:10px 14px;text-align:left;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#1E40AF;border-bottom:2px solid #BFDBFE}}
+  td{{padding:10px 14px;border-bottom:1px solid #EFF6FF}}
+  tr:last-child td{{border-bottom:none}}
+  tr:hover td{{background:#F8FAFF}}
+  code{{font-family:monospace;font-size:11px}}
+  .integrity{{font-size:11px;color:#9CA3AF;font-family:monospace;margin-top:20px;padding-top:14px;border-top:1px solid #E5E7EB}}
+  footer{{text-align:center;padding:20px;font-size:12px;color:#9CA3AF}}
 </style>
 </head>
 <body>
-<h1>🛡️ CRUCIBLE Resilience Report</h1>
-<div class="meta">Run: {report['run_id']} &nbsp;·&nbsp; {report.get('generated_at','')[:19].replace('T',' ')} UTC &nbsp;·&nbsp; Playbook: {report.get('playbook_version','')}</div>
+<header>
+  <h1>⚔️ CRUCIBLE Resilience Report</h1>
+  <div class="meta">Run: {report['run_id']} &nbsp;·&nbsp; {report.get('generated_at','')[:19].replace('T',' ')} UTC &nbsp;·&nbsp; Playbook: {report.get('playbook_version','')}{intent_meta}</div>
+</header>
 
-<div class="score-box">
-  <div>
-    <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:#6B7280;margin-bottom:4px">ARS Score</div>
-    <div class="ars-num">{ars:.2f}</div>
-    <div style="font-size:11px;color:#6B7280;margin-top:4px">{ars_pct}% resilience</div>
+<div class="main">
+
+  <div class="gate-bar">
+    <div>
+      <div class="ars-label">Adversarial Resilience Score</div>
+      <div class="gate-verdict">{ars:.2f} <span style="font-size:16px;font-weight:500;color:#6B7280">/ 1.00</span></div>
+    </div>
+    <div><span class="gate-badge">CI/CD GATE: {gate}</span></div>
+    <div class="stat-chips">
+      <span class="chip">{report.get('attack_count',0)} attacks</span>
+      <span class="chip green">{report.get('mitigated_count',0)} mitigated</span>
+      <span class="chip amber">{report.get('partial_count',0)} partial</span>
+      <span class="chip red">{report.get('miss_count',0)} missed</span>
+      <span class="chip">{report.get('elapsed_seconds',0)}s</span>
+    </div>
   </div>
-  <div><span class="gate-badge">{gate}</span></div>
-  <div class="stat"><strong>{report.get('attack_count',0)}</strong>Attacks fired</div>
-  <div class="stat"><strong>{report.get('mitigated_count',0)}</strong>Mitigated</div>
-  <div class="stat"><strong>{report.get('partial_count',0)}</strong>Partial</div>
-  <div class="stat"><strong style="color:#B91C1C">{report.get('miss_count',0)}</strong>Missed</div>
-  <div class="stat"><strong>{report.get('elapsed_seconds',0)}s</strong>Elapsed</div>
+
+  <div class="section-title">🔍 Vulnerability Findings</div>
+  {no_findings_msg}{finding_cards}
+
+  <div class="section-title">📋 Full Attack Breakdown</div>
+  <table>
+  <thead><tr><th>ID</th><th>CWE</th><th>Vulnerability</th><th>Severity</th><th>Verdict</th><th>Remediation</th></tr></thead>
+  <tbody>{all_rows}</tbody>
+  </table>
+
+  <div class="section-title">🏛️ Compliance Control Mappings</div>
+  <table>
+  <thead><tr><th>Framework</th><th>Controls</th></tr></thead>
+  <tbody>{control_rows}</tbody>
+  </table>
+
+  <div class="integrity">SHA-256 Integrity: {report.get('integrity_hash','')}</div>
 </div>
 
-<h2>Attack Breakdown</h2>
-<table>
-<thead><tr><th>ID</th><th>CWE</th><th>Title</th><th>Severity</th><th>Verdict</th></tr></thead>
-<tbody>{attack_rows}</tbody>
-</table>
-
-<h2>Compliance Control Mappings</h2>
-<table>
-<thead><tr><th>Framework</th><th>Controls</th></tr></thead>
-<tbody>{control_rows}</tbody>
-</table>
-
-<div class="integrity">Integrity: {report.get('integrity_hash','')}</div>
+<footer>CRUCIBLE Adversarial Co-Generation Engine &nbsp;·&nbsp; Built by Sanjoy Ghosh</footer>
 </body>
 </html>"""
 
