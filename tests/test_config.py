@@ -122,3 +122,96 @@ def test_config_source_none_by_default():
     callers must not assume a project was found just because reports_dir exists."""
     cfg = CrucibleConfig()
     assert cfg.config_source is None
+
+
+# ── last-project fallback (read-only commands like `dashboard`/`status` should ──
+# ── just work from anywhere, without ever requiring an explicit --config) ───────
+
+def test_load_remembers_project_after_finding_via_cwd(tmp_path, monkeypatch):
+    project = tmp_path / "myproject"
+    project.mkdir()
+    (project / ".crucible.yml").write_text("version: 1\n")
+    monkeypatch.chdir(project)
+
+    CrucibleConfig.load()
+
+    # isolated_home (conftest.py) points $HOME at this same tmp_path.
+    last_project_file = tmp_path / ".crucible" / "last_project"
+    assert last_project_file.exists()
+    assert last_project_file.read_text().strip() == str(project)
+
+
+def test_load_falls_back_to_remembered_project_from_unrelated_dir(tmp_path, monkeypatch):
+    project = tmp_path / "myproject"
+    project.mkdir()
+    (project / ".crucible.yml").write_text("version: 1\n")
+    monkeypatch.chdir(project)
+    CrucibleConfig.load()  # remembers `project`
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    cfg = CrucibleConfig.load()
+    assert cfg.config_source == (project / ".crucible.yml").resolve()
+
+
+def test_cwd_project_wins_over_remembered_project(tmp_path, monkeypatch):
+    old_project = tmp_path / "old_project"
+    old_project.mkdir()
+    (old_project / ".crucible.yml").write_text("version: 1\n")
+    monkeypatch.chdir(old_project)
+    CrucibleConfig.load()  # remembers old_project
+
+    new_project = tmp_path / "new_project"
+    new_project.mkdir()
+    (new_project / ".crucible.yml").write_text("version: 1\n")
+    monkeypatch.chdir(new_project)
+
+    cfg = CrucibleConfig.load()
+    assert cfg.config_source == (new_project / ".crucible.yml").resolve()
+
+
+def test_explicit_config_wins_over_remembered_project(tmp_path, monkeypatch):
+    old_project = tmp_path / "old_project"
+    old_project.mkdir()
+    (old_project / ".crucible.yml").write_text("version: 1\n")
+    monkeypatch.chdir(old_project)
+    CrucibleConfig.load()  # remembers old_project
+
+    explicit_project = tmp_path / "explicit_project"
+    explicit_project.mkdir()
+    (explicit_project / ".crucible.yml").write_text("version: 1\n")
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    cfg = CrucibleConfig.load(explicit_project / ".crucible.yml")
+    assert cfg.config_source == (explicit_project / ".crucible.yml").resolve()
+
+
+def test_recall_returns_none_when_remembered_project_deleted(tmp_path, monkeypatch):
+    project = tmp_path / "myproject"
+    project.mkdir()
+    (project / ".crucible.yml").write_text("version: 1\n")
+    monkeypatch.chdir(project)
+    CrucibleConfig.load()  # remembers project
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    import shutil
+    shutil.rmtree(project)
+
+    cfg = CrucibleConfig.load()
+    assert cfg.config_source is None
+
+
+def test_no_project_found_and_none_remembered(tmp_path, monkeypatch):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    cfg = CrucibleConfig.load()
+    assert cfg.config_source is None

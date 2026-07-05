@@ -88,9 +88,25 @@ class CrucibleConfig:
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "CrucibleConfig":
-        """Load config from .crucible.yml, walking up from cwd if path not given."""
+        """Load config from .crucible.yml.
+
+        Resolution order when `path` isn't given explicitly:
+          1. Walk up from cwd (same convention as git/npm) — correct when you're
+             inside the project you mean to test.
+          2. Fall back to the last project any `crucible` command successfully
+             resolved on this machine — so read-only commands like `crucible
+             dashboard`/`crucible status` just work from anywhere (a fresh
+             terminal at $HOME, a different tab, etc.) without ever needing an
+             explicit --config. Whichever project you're actually inside always
+             wins over this fallback.
+        """
+        explicit = path is not None
+        via_cwd_walk = False
         if path is None:
             path = _find_config()
+            via_cwd_walk = path is not None
+            if path is None:
+                path = _recall_last_project()
 
         cfg = cls()
         deployment_explicit = False
@@ -103,6 +119,10 @@ class CrucibleConfig:
         project_root = Path(path).resolve().parent if found else Path.cwd()
         cfg.reports_dir = project_root / ".crucible" / "reports"
         cfg.config_source = Path(path).resolve() if found else None
+        if found and (explicit or via_cwd_walk):
+            # Only remember projects found via cwd-walk or an explicit --config —
+            # never re-remember a project we only reached via the fallback itself.
+            _remember_project(project_root)
 
         if found:
             with open(path) as f:
@@ -229,6 +249,36 @@ def _find_config() -> Path | None:
         if candidate.exists():
             return candidate
     return None
+
+
+def _last_project_file() -> Path:
+    # Resolved fresh on every call (not a module-level constant) so tests can
+    # isolate it by monkeypatching the HOME env var.
+    return Path.home() / ".crucible" / "last_project"
+
+
+def _remember_project(project_root: Path) -> None:
+    """Record the most recently used project globally, so read-only commands
+    (dashboard, status) can find it later even from outside the project tree."""
+    try:
+        f = _last_project_file()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(str(project_root))
+    except OSError:
+        pass  # best-effort — never block a command over this
+
+
+def _recall_last_project() -> Path | None:
+    """The last project any `crucible` command resolved on this machine, if its
+    .crucible.yml still exists."""
+    try:
+        f = _last_project_file()
+        if not f.exists():
+            return None
+        candidate = Path(f.read_text().strip()) / ".crucible.yml"
+        return candidate if candidate.exists() else None
+    except OSError:
+        return None
 
 
 DEFAULT_CONFIG_YAML = """\

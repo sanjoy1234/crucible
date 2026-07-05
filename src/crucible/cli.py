@@ -1820,9 +1820,9 @@ def prune(older_than: str, dry_run: bool):
 @click.option("--host", default="127.0.0.1", show_default=True, help="Host to bind")
 @click.option("--reload", is_flag=True, help="Enable auto-reload (development only)")
 @click.option("--config", "config_path", default=None,
-              help="Path to .crucible.yml. Needed when launching the dashboard from "
-                   "outside your project directory (e.g. a fresh terminal at ~) — "
-                   "otherwise it can't find your reports.")
+              help="Path to .crucible.yml. You shouldn't need this — the dashboard "
+                   "remembers your last-used project automatically. Only useful for "
+                   "pointing at a project you've never run crucible in from this machine.")
 def dashboard(port: int, host: str, reload: bool, config_path: str | None):
     """Launch the Combat Dashboard web UI."""
     try:
@@ -1844,10 +1844,11 @@ def dashboard(port: int, host: str, reload: bool, config_path: str | None):
         console.print(f"  Project: [dim]{cfg.config_source.parent}[/dim]")
     else:
         console.print(
-            f"  [yellow]⚠  No .crucible.yml found from {Path.cwd()} upward — "
-            f"you're likely outside your project directory.[/yellow]\n"
+            f"  [yellow]⚠  No CRUCIBLE project found — never seen from this directory, "
+            f"and nothing remembered from a previous run.[/yellow]\n"
             f"     Reports will be read from: [dim]{cfg.reports_dir}[/dim] (probably empty)\n"
-            f"     Fix: [bold]cd[/bold] into your project, or launch with "
+            f"     Fix: run any [bold]crucible[/bold] command inside your project once "
+            f"(e.g. [bold]crucible status[/bold]), or launch with "
             f"[bold cyan]crucible dashboard --config /path/to/.crucible.yml[/bold cyan]"
         )
     console.print(f"  Stop: Ctrl+C\n")
@@ -1874,8 +1875,9 @@ def dashboard(port: int, host: str, reload: bool, config_path: str | None):
 @click.option("--rbac/--no-rbac", default=False, show_default=True,
               help="Enable GitHub team-based RBAC (requires GITHUB_ORG + team env vars)")
 @click.option("--config", "config_path", default=None,
-              help="Path to .crucible.yml. Needed when launching from outside your "
-                   "project directory — otherwise the dashboard can't find your reports.")
+              help="Path to .crucible.yml. You shouldn't need this — the dashboard "
+                   "remembers your last-used project automatically. Only useful for "
+                   "pointing at a project you've never run crucible in from this machine.")
 def serve(port: int, host: str, reload: bool, rbac: bool, config_path: str | None):
     """Start CRUCIBLE CPaaS (GitHub App webhook server)."""
     try:
@@ -1891,10 +1893,11 @@ def serve(port: int, host: str, reload: bool, rbac: bool, config_path: str | Non
         os.environ["CRUCIBLE_CONFIG_PATH"] = str(crucible_cfg.config_source)
     else:
         console.print(
-            f"  [yellow]⚠  No .crucible.yml found from {Path.cwd()} upward — "
-            f"you're likely outside your project directory.[/yellow]\n"
+            f"  [yellow]⚠  No CRUCIBLE project found — never seen from this directory, "
+            f"and nothing remembered from a previous run.[/yellow]\n"
             f"     Reports will be read from: [dim]{crucible_cfg.reports_dir}[/dim] (probably empty)\n"
-            f"     Fix: [bold]cd[/bold] into your project, or launch with "
+            f"     Fix: run any [bold]crucible[/bold] command inside your project once "
+            f"(e.g. [bold]crucible status[/bold]), or launch with "
             f"[bold cyan]crucible serve --config /path/to/.crucible.yml[/bold cyan]\n"
         )
 

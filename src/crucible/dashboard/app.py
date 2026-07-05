@@ -159,9 +159,10 @@ def create_app(config: CrucibleConfig | None = None):  # returns FastAPI when in
         if cfg.config_source is None:
             no_project_banner = f"""
   <div style="background:#FEF2F2;border:1px solid #FCA5A5;border-radius:10px;padding:14px 16px;margin-bottom:20px;font-size:12px;color:#991B1B;line-height:1.6">
-    &#x26A0;&#xFE0F; <strong>No .crucible.yml found</strong> from {Path.cwd()} upward — this is
-    probably the wrong project. Reports are being read from {cfg.reports_dir}.
-    Fix: <code>cd</code> into your project, or relaunch with <code>--config /path/to/.crucible.yml</code>.
+    &#x26A0;&#xFE0F; <strong>No CRUCIBLE project found</strong> — nothing remembered from a
+    previous run either. Reports are being read from {cfg.reports_dir}.
+    Fix: run any <code>crucible</code> command inside your project once, then this will
+    resolve automatically from anywhere.
   </div>"""
         html = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
@@ -559,22 +560,23 @@ def _render_index(reports: list[dict], cfg: CrucibleConfig, active_runs: list[di
     # ── Active runs (in progress — foreground or --background) ───────────────
     active_runs = active_runs or []
     active_html = ""
-    # ── No .crucible.yml found anywhere — warn instead of silently showing 0 runs ──
+    # ── No project found at all — not via cwd, not remembered from a previous
+    # run either. Warn instead of silently showing 0 runs. This should be rare:
+    # normally the dashboard remembers whatever project you last ran crucible in.
     no_project_html = ""
     if cfg.config_source is None:
         no_project_html = f"""
 <div class="runs-card" style="border-color:#FCA5A5;margin-bottom:20px">
   <div class="card-hdr" style="background:linear-gradient(90deg,#FEF2F2,#fff);border-bottom-color:#FCA5A5;color:#991B1B">
-    &#x26A0;&#xFE0F; No .crucible.yml found &mdash; this is probably the wrong project
+    &#x26A0;&#xFE0F; No CRUCIBLE project found
   </div>
   <div style="padding:16px 20px;font-size:13px;color:#374151;line-height:1.7">
     This dashboard was launched from <code class="run-code">{Path.cwd()}</code>, which isn't inside
-    a CRUCIBLE project (or any of its parent directories). It's reading
-    (and will only ever find reports in) <code class="run-code">{cfg.reports_dir}</code> &mdash;
-    almost certainly not where your runs actually are.<br><br>
-    <strong>Fix:</strong> stop this dashboard, then either <code class="run-code">cd</code> into your
-    project directory before running <code class="run-code">crucible dashboard</code> again, or launch it with
-    <code class="run-code">crucible dashboard --config /path/to/.crucible.yml</code>.
+    a CRUCIBLE project, and nothing was remembered from a previous run on this machine either.
+    It's reading (and will only ever find reports in) <code class="run-code">{cfg.reports_dir}</code>.<br><br>
+    <strong>Fix:</strong> run any <code class="run-code">crucible</code> command inside your project once
+    (e.g. <code class="run-code">crucible status</code>) — after that, <code class="run-code">crucible dashboard</code>
+    will find it automatically from anywhere, no flags needed.
   </div>
 </div>
 """

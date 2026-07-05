@@ -376,7 +376,7 @@ class TestDashboardCommand:
         flat_output = result.output.replace("\n", "")
         assert "Project:" in flat_output
         assert str(tmp_path) in flat_output
-        assert "No .crucible.yml found" not in flat_output
+        assert "No CRUCIBLE project found" not in flat_output
         assert mock_run.called
 
     def test_warns_when_launched_outside_any_project(self, tmp_path):
@@ -385,6 +385,6 @@ class TestDashboardCommand:
             with patch("uvicorn.run") as mock_run:
                 result = runner.invoke(main, ["dashboard"])
         assert result.exit_code == 0, result.output
-        assert "No .crucible.yml found" in result.output
+        assert "No CRUCIBLE project found" in result.output
         assert "--config" in result.output
         assert mock_run.called

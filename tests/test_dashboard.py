@@ -194,14 +194,14 @@ def test_render_index_warns_when_no_project_found():
     cfg = CrucibleConfig()
     assert cfg.config_source is None
     html = _render_index([], cfg, [])
-    assert "No .crucible.yml found" in html
+    assert "No CRUCIBLE project found" in html
 
 
 def test_render_index_no_warning_when_project_found(tmp_path):
     cfg = CrucibleConfig()
     cfg.config_source = tmp_path / ".crucible.yml"
     html = _render_index([], cfg, [])
-    assert "No .crucible.yml found" not in html
+    assert "No CRUCIBLE project found" not in html
 
 
 def test_render_index_chart_data_is_valid_json():
@@ -328,7 +328,7 @@ def test_status_page_warns_when_no_project_found(tmp_path):
     client = TestClient(create_app(cfg))
 
     resp = client.get("/status")
-    assert "No .crucible.yml found" in resp.text
+    assert "No CRUCIBLE project found" in resp.text
 
 
 # ── pyproject.toml [ui] extra ──────────────────────────────────────────────────
