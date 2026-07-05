@@ -43,6 +43,27 @@ def test_missing_config_returns_defaults(tmp_path):
     assert cfg.gate.minimum_ars == 0.80
 
 
+def test_reports_dir_anchored_to_project_root_not_invoking_cwd(tmp_path, monkeypatch):
+    """`crucible dashboard`/`crucible status` must resolve the same reports_dir as
+    `crucible run` regardless of which subdirectory of the project they're invoked
+    from — otherwise a dashboard launched from a different terminal/cwd silently
+    reads an empty, unrelated .crucible/reports."""
+    project_root = tmp_path / "project"
+    subdir = project_root / "some" / "nested" / "dir"
+    subdir.mkdir(parents=True)
+    (project_root / ".crucible.yml").write_text("version: 1\n")
+
+    monkeypatch.chdir(subdir)
+    cfg = CrucibleConfig.load()
+    assert cfg.reports_dir == project_root / ".crucible" / "reports"
+
+
+def test_reports_dir_anchored_at_project_root_itself(tmp_path):
+    (tmp_path / ".crucible.yml").write_text("version: 1\n")
+    cfg = CrucibleConfig.load(tmp_path / ".crucible.yml")
+    assert cfg.reports_dir == tmp_path / ".crucible" / "reports"
+
+
 def test_explicit_deployment_wins_over_stale_api_key(tmp_path, monkeypatch):
     """A user's explicit `model_provider: local` in .crucible.yml must not be
     silently overridden just because an unrelated API key is sitting in the env."""
@@ -80,3 +101,24 @@ def test_zero_config_still_autodetects_from_api_key(tmp_path, monkeypatch):
 
     cfg = CrucibleConfig.load(tmp_path / "nonexistent.yml")
     assert cfg.effective_model_provider == "anthropic"
+
+
+# ── config_source ─────────────────────────────────────────────────────────────
+
+def test_config_source_set_when_found(tmp_path):
+    config_file = tmp_path / ".crucible.yml"
+    config_file.write_text("version: 1\n")
+    cfg = CrucibleConfig.load(config_file)
+    assert cfg.config_source == config_file.resolve()
+
+
+def test_config_source_none_when_not_found(tmp_path):
+    cfg = CrucibleConfig.load(tmp_path / "nonexistent.yml")
+    assert cfg.config_source is None
+
+
+def test_config_source_none_by_default():
+    """A bare CrucibleConfig() (not built via .load()) has no known source —
+    callers must not assume a project was found just because reports_dir exists."""
+    cfg = CrucibleConfig()
+    assert cfg.config_source is None

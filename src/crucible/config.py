@@ -81,6 +81,10 @@ class CrucibleConfig:
 
     # resolved at load time
     reports_dir: Path = field(default_factory=lambda: Path(".crucible/reports"))
+    # Path to the .crucible.yml actually found, or None if none was found anywhere
+    # up the directory tree — lets callers (e.g. the dashboard) warn the user
+    # instead of silently showing an empty project.
+    config_source: Path | None = field(default=None)
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "CrucibleConfig":
@@ -91,7 +95,16 @@ class CrucibleConfig:
         cfg = cls()
         deployment_explicit = False
 
-        if path is not None and Path(path).exists():
+        # Anchor reports_dir to the project root (where .crucible.yml lives), not to
+        # whatever directory the process happens to be invoked from. Without this,
+        # `crucible dashboard` run from a different terminal/cwd than `crucible run`
+        # silently reads/writes a completely different, empty .crucible/reports.
+        found = path is not None and Path(path).exists()
+        project_root = Path(path).resolve().parent if found else Path.cwd()
+        cfg.reports_dir = project_root / ".crucible" / "reports"
+        cfg.config_source = Path(path).resolve() if found else None
+
+        if found:
             with open(path) as f:
                 raw = yaml.safe_load(f) or {}
 

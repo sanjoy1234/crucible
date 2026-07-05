@@ -1819,7 +1819,11 @@ def prune(older_than: str, dry_run: bool):
 @click.option("--port", default=8080, show_default=True, help="Port to listen on")
 @click.option("--host", default="127.0.0.1", show_default=True, help="Host to bind")
 @click.option("--reload", is_flag=True, help="Enable auto-reload (development only)")
-def dashboard(port: int, host: str, reload: bool):
+@click.option("--config", "config_path", default=None,
+              help="Path to .crucible.yml. Needed when launching the dashboard from "
+                   "outside your project directory (e.g. a fresh terminal at ~) — "
+                   "otherwise it can't find your reports.")
+def dashboard(port: int, host: str, reload: bool, config_path: str | None):
     """Launch the Combat Dashboard web UI."""
     try:
         import uvicorn  # noqa: F401
@@ -1829,8 +1833,23 @@ def dashboard(port: int, host: str, reload: bool):
         console.print("Fix with: [bold]pip install fastapi uvicorn[/bold]")
         sys.exit(1)
 
+    import os
+    cfg = CrucibleConfig.load(config_path)
+    if cfg.config_source:
+        os.environ["CRUCIBLE_CONFIG_PATH"] = str(cfg.config_source)
+
     console.print(f"\n[bold]CRUCIBLE Combat Dashboard[/bold]")
     console.print(f"  URL:  [link=http://{host}:{port}]http://{host}:{port}[/link]")
+    if cfg.config_source:
+        console.print(f"  Project: [dim]{cfg.config_source.parent}[/dim]")
+    else:
+        console.print(
+            f"  [yellow]⚠  No .crucible.yml found from {Path.cwd()} upward — "
+            f"you're likely outside your project directory.[/yellow]\n"
+            f"     Reports will be read from: [dim]{cfg.reports_dir}[/dim] (probably empty)\n"
+            f"     Fix: [bold]cd[/bold] into your project, or launch with "
+            f"[bold cyan]crucible dashboard --config /path/to/.crucible.yml[/bold cyan]"
+        )
     console.print(f"  Stop: Ctrl+C\n")
 
     import uvicorn
@@ -1854,7 +1873,10 @@ def dashboard(port: int, host: str, reload: bool):
 @click.option("--reload", is_flag=True, help="Enable auto-reload (development only)")
 @click.option("--rbac/--no-rbac", default=False, show_default=True,
               help="Enable GitHub team-based RBAC (requires GITHUB_ORG + team env vars)")
-def serve(port: int, host: str, reload: bool, rbac: bool):
+@click.option("--config", "config_path", default=None,
+              help="Path to .crucible.yml. Needed when launching from outside your "
+                   "project directory — otherwise the dashboard can't find your reports.")
+def serve(port: int, host: str, reload: bool, rbac: bool, config_path: str | None):
     """Start CRUCIBLE CPaaS (GitHub App webhook server)."""
     try:
         import uvicorn  # noqa: F401
@@ -1862,6 +1884,19 @@ def serve(port: int, host: str, reload: bool, rbac: bool):
         console.print("[red]Error:[/red] crucible serve requires FastAPI and Uvicorn.")
         console.print("Install with: [bold]pip install crucible-ai[ui][/bold]")
         sys.exit(1)
+
+    import os
+    crucible_cfg = CrucibleConfig.load(config_path)
+    if crucible_cfg.config_source:
+        os.environ["CRUCIBLE_CONFIG_PATH"] = str(crucible_cfg.config_source)
+    else:
+        console.print(
+            f"  [yellow]⚠  No .crucible.yml found from {Path.cwd()} upward — "
+            f"you're likely outside your project directory.[/yellow]\n"
+            f"     Reports will be read from: [dim]{crucible_cfg.reports_dir}[/dim] (probably empty)\n"
+            f"     Fix: [bold]cd[/bold] into your project, or launch with "
+            f"[bold cyan]crucible serve --config /path/to/.crucible.yml[/bold cyan]\n"
+        )
 
     from .service.config import ServiceConfig
     cfg = ServiceConfig.from_env()

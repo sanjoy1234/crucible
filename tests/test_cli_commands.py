@@ -362,3 +362,29 @@ class TestSetupCommand:
 
             env_text = Path(".env").read_text()
             assert "MODEL_PROVIDER=local" in env_text
+
+
+# ── crucible dashboard ───────────────────────────────────────────────────────
+
+class TestDashboardCommand:
+    def test_config_flag_points_at_explicit_project(self, tmp_path):
+        (tmp_path / ".crucible.yml").write_text("version: 1\n")
+        runner = CliRunner()
+        with patch("uvicorn.run") as mock_run:
+            result = runner.invoke(main, ["dashboard", "--config", str(tmp_path / ".crucible.yml")])
+        assert result.exit_code == 0, result.output
+        flat_output = result.output.replace("\n", "")
+        assert "Project:" in flat_output
+        assert str(tmp_path) in flat_output
+        assert "No .crucible.yml found" not in flat_output
+        assert mock_run.called
+
+    def test_warns_when_launched_outside_any_project(self, tmp_path):
+        runner = CliRunner()
+        with runner.isolated_filesystem(temp_dir=tmp_path):
+            with patch("uvicorn.run") as mock_run:
+                result = runner.invoke(main, ["dashboard"])
+        assert result.exit_code == 0, result.output
+        assert "No .crucible.yml found" in result.output
+        assert "--config" in result.output
+        assert mock_run.called

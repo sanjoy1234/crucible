@@ -188,6 +188,22 @@ def test_render_index_no_active_runs_shows_nothing_extra():
     assert "RUNNING" not in html
 
 
+def test_render_index_warns_when_no_project_found():
+    """cfg.config_source is None when no .crucible.yml was found anywhere up the
+    tree — the dashboard must warn loudly instead of silently showing 0 runs."""
+    cfg = CrucibleConfig()
+    assert cfg.config_source is None
+    html = _render_index([], cfg, [])
+    assert "No .crucible.yml found" in html
+
+
+def test_render_index_no_warning_when_project_found(tmp_path):
+    cfg = CrucibleConfig()
+    cfg.config_source = tmp_path / ".crucible.yml"
+    html = _render_index([], cfg, [])
+    assert "No .crucible.yml found" not in html
+
+
 def test_render_index_chart_data_is_valid_json():
     cfg = CrucibleConfig()
     reports = [_make_report(f"run-{i}", 0.8 + i * 0.01) for i in range(3)]
@@ -296,6 +312,23 @@ def test_status_page_shows_active_run_count(tmp_path):
     )
     resp = client.get("/status")
     assert "Active Runs" in resp.text
+
+
+def test_status_page_warns_when_no_project_found(tmp_path):
+    """create_app(config=None) with no CRUCIBLE_CONFIG_PATH and no .crucible.yml
+    reachable from cwd must warn on /status, not silently show an empty project."""
+    import pytest
+    try:
+        from fastapi.testclient import TestClient
+    except ImportError:
+        pytest.skip("fastapi not installed — skipping live app test")
+    cfg = CrucibleConfig()
+    cfg.reports_dir = tmp_path / "reports"
+    assert cfg.config_source is None
+    client = TestClient(create_app(cfg))
+
+    resp = client.get("/status")
+    assert "No .crucible.yml found" in resp.text
 
 
 # ── pyproject.toml [ui] extra ──────────────────────────────────────────────────

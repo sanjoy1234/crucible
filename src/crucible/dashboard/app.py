@@ -43,7 +43,10 @@ def _require_fastapi():
 def create_app(config: CrucibleConfig | None = None):  # returns FastAPI when installed
     _require_fastapi()
 
-    cfg = config or CrucibleConfig.load()
+    # CRUCIBLE_CONFIG_PATH is set by `crucible dashboard --config ...` / `crucible serve
+    # --config ...` — needed because uvicorn calls this factory with no arguments, so an
+    # explicit --config can't be passed through directly.
+    cfg = config or CrucibleConfig.load(os.environ.get("CRUCIBLE_CONFIG_PATH"))
     runs_dir = cfg.reports_dir.parent / "runs"
     app = FastAPI(title="CRUCIBLE Combat Dashboard", version="0.1.0")
 
@@ -152,6 +155,14 @@ def create_app(config: CrucibleConfig | None = None):  # returns FastAPI when in
             f'<div class="row"><span class="lbl">Active Runs</span>'
             f'<span class="val {"warn" if active else "ok"}">{len(active)}</span></div>'
         ) if active else ""
+        no_project_banner = ""
+        if cfg.config_source is None:
+            no_project_banner = f"""
+  <div style="background:#FEF2F2;border:1px solid #FCA5A5;border-radius:10px;padding:14px 16px;margin-bottom:20px;font-size:12px;color:#991B1B;line-height:1.6">
+    &#x26A0;&#xFE0F; <strong>No .crucible.yml found</strong> from {Path.cwd()} upward — this is
+    probably the wrong project. Reports are being read from {cfg.reports_dir}.
+    Fix: <code>cd</code> into your project, or relaunch with <code>--config /path/to/.crucible.yml</code>.
+  </div>"""
         html = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -174,6 +185,7 @@ a:hover{{background:#2563EB}}
 <div class="card">
   <h1><span class="dot"></span> CRUCIBLE — System Status</h1>
   <div class="sub">Adversarial Co-Generation Engine &mdash; all systems operational</div>
+  {no_project_banner}
   <div class="row"><span class="lbl">Service</span><span class="val ok">&#x2705; crucible-dashboard</span></div>
   <div class="row"><span class="lbl">Model / Provider</span><span class="val">{model_label}</span></div>
   {active_row}
@@ -547,6 +559,25 @@ def _render_index(reports: list[dict], cfg: CrucibleConfig, active_runs: list[di
     # ── Active runs (in progress — foreground or --background) ───────────────
     active_runs = active_runs or []
     active_html = ""
+    # ── No .crucible.yml found anywhere — warn instead of silently showing 0 runs ──
+    no_project_html = ""
+    if cfg.config_source is None:
+        no_project_html = f"""
+<div class="runs-card" style="border-color:#FCA5A5;margin-bottom:20px">
+  <div class="card-hdr" style="background:linear-gradient(90deg,#FEF2F2,#fff);border-bottom-color:#FCA5A5;color:#991B1B">
+    &#x26A0;&#xFE0F; No .crucible.yml found &mdash; this is probably the wrong project
+  </div>
+  <div style="padding:16px 20px;font-size:13px;color:#374151;line-height:1.7">
+    This dashboard was launched from <code class="run-code">{Path.cwd()}</code>, which isn't inside
+    a CRUCIBLE project (or any of its parent directories). It's reading
+    (and will only ever find reports in) <code class="run-code">{cfg.reports_dir}</code> &mdash;
+    almost certainly not where your runs actually are.<br><br>
+    <strong>Fix:</strong> stop this dashboard, then either <code class="run-code">cd</code> into your
+    project directory before running <code class="run-code">crucible dashboard</code> again, or launch it with
+    <code class="run-code">crucible dashboard --config /path/to/.crucible.yml</code>.
+  </div>
+</div>
+"""
     if active_runs:
         active_rows = "".join(
             '<tr class="run-row">'
@@ -878,6 +909,9 @@ footer{margin-top:8px;padding:16px 32px;border-top:1px solid #DBEAFE;font-size:1
 </div>
 
 <div class="main">
+
+<!-- ── No project found warning ───────────────────────────────────────── -->
+{no_project_html}
 
 <!-- ── Active runs (in progress) ─────────────────────────────────────── -->
 {active_html}
