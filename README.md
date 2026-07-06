@@ -52,7 +52,7 @@ scanner to catch up to code that shipped last week.
 
 ## See it run
 
-<video src="https://github.com/user-attachments/assets/926a30be-4665-4176-9dbc-606310305636" controls muted></video> — setup through CI gate, real terminal output, real dashboard.
+<video src="https://github.com/user-attachments/assets/b7ef02c9-5e1a-4f4f-a5b0-9be55dabe838" controls muted></video> — setup through CI gate, real terminal output, real dashboard.
 
 ---
 
