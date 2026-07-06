@@ -48,7 +48,7 @@ scanner to catch up to code that shipped last week.
   <img src="docs/media/CRUCIBLE_Demo_thumbnail.png" alt="CRUCIBLE demo video" width="640">
 </a>
 
-**▶ [Watch the 2.5-minute demo](docs/media/CRUCIBLE_Demo.mp4)** — setup through CI gate, real terminal output, real dashboard.
+<video src="https://github.com/user-attachments/assets/926a30be-4665-4176-9dbc-606310305636" controls muted></video> — setup through CI gate, real terminal output, real dashboard.
 
 **📊 [Read the one-page overview (PDF)](docs/media/CRUCIBLE_Overview.pdf)** — what it is, what's different, how it deploys. Built for sharing with a technical lead or architecture review board.
 
