@@ -65,8 +65,13 @@ def execute(run_id: str, config_path: str | None = None) -> LearnResult:
         verdict = attack.get("verdict", "MISSED")
         score = 1.0 if verdict == "MITIGATED" else (0.5 if verdict == "PARTIAL" else 0.0)
 
-        tags = tag_attack(cwe=cwe, domain=report.get("playbook_version", "").split("@")[0])
-        metadata = tags_to_metadata(tags)
+        tags = tag_attack(
+            cwe=cwe,
+            severity=attack.get("severity", "medium"),
+            confidence=attack.get("confidence", 5),
+            policy_domains=[report.get("playbook_version", "").split("@")[0]],
+        )
+        metadata = tags_to_metadata(tags, run_id=run_id, round_number=0)
         metadata["run_id"] = run_id
         metadata["score"] = score
 

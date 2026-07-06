@@ -21,15 +21,6 @@
       "url": "https://raw.githubusercontent.com/sanjoy1234/crucible/main/policy-hub/domains/nist_ssdf.yaml",
       "scenarios_count": 8,
       "tags": ["nist", "ssdf", "government", "supply-chain"]
-    },
-    {
-      "name": "cis_controls",
-      "version": "8.0",
-      "description": "CIS Controls v8 — Safeguard 16 (Application Software Security) attack scenarios",
-      "regulatory_framework": "CIS Controls v8",
-      "url": "https://raw.githubusercontent.com/sanjoy1234/crucible/main/policy-hub/domains/cis_controls.yaml",
-      "scenarios_count": 6,
-      "tags": ["cis", "enterprise", "security-controls"]
     }
   ]
 }

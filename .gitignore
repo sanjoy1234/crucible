@@ -32,12 +32,16 @@ htmlcov/
 .crucible/reports/
 .crucible/forge/
 .crucible/brain/
+.crucible/runs/
+.crucible/vault/
+.crucible/policies/
 # Keep .crucible.yml (config template) — DO commit it
 
 # IDE / OS
 .DS_Store
 .idea/
 .vscode/settings.json
+.claude/settings.local.json
 *.swp
 ~$*
 
@@ -49,7 +53,9 @@ htmlcov/
 # Secrets — never commit
 .env.local
 *.pem
+*.key
 secrets.json
+crucible-app.private-key.pem
 
 # Claude Code workspace config — not for public repo
 CLAUDE.md
