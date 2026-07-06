@@ -45,7 +45,12 @@ scanner to catch up to code that shipped last week.
 ## See it run
 <video src="https://github.com/user-attachments/assets/926a30be-4665-4176-9dbc-606310305636" controls muted></video> — setup through CI gate, real terminal output, real dashboard.
 
-**📊 [Read the one-page overview (PDF)](docs/media/CRUCIBLE_Overview.pdf)** — what it is, what's different, how it deploys. Built for sharing with a technical lead or architecture review board.
+**📊 One-page overview** — what it is, what's different, how it deploys. Built for sharing with a technical lead or architecture review board.
+
+<img src="docs/media/CRUCIBLE_Overview_slide1.jpg" alt="CRUCIBLE overview — slide 1" width="800">
+<img src="docs/media/CRUCIBLE_Overview_slide2.jpg" alt="CRUCIBLE overview — slide 2" width="800">
+
+**[Download the full PDF](https://github.com/user-attachments/files/29713851/CRUCIBLE_Overview.pdf)**
 
 ---
 
